@@ -1138,6 +1138,74 @@ def crawl_reviews(
         total_count = playwright_info.get("total", 0)
         working_endpoint = playwright_info["api_url"]
         log(f"✅ Playwright API 성공: {len(page1_reviews)}개 리뷰")
+
+        # 캡처된 요청 파라미터 로그
+        if playwright_info.get("req_body"):
+            log(f"ℹ️ 요청 바디: {str(playwright_info['req_body'])[:200]}")
+        elif playwright_info.get("req_params"):
+            log(f"ℹ️ 쿼리 파라미터: {str(playwright_info['req_params'])[:200]}")
+
+        # ── /checksum 엔드포인트인 경우 전체 리뷰 엔드포인트 시도 ──
+        # checksum은 일부 리뷰만 반환하므로, 브라우저 헤더로 진짜 리뷰 목록 호출
+        if "/checksum" in working_endpoint:
+            log("🔄 checksum 감지 → 전체 리뷰 엔드포인트 시도...")
+            _base = working_endpoint.rsplit("/checksum", 1)[0]  # /review/api/v2/reviews
+            _hdr = {
+                k: v for k, v in playwright_info.get("req_headers", {}).items()
+                if k.lower() not in (":method", ":path", ":scheme", ":authority",
+                                     "content-length", "transfer-encoding")
+            }
+            _sort_map = {"date": None, "useful": "USEFUL_SCORE_DESC",
+                         "star_desc": "RATING_DESC", "star_asc": "RATING_ASC"}
+            _sort_val = _sort_map.get(sort)
+
+            # 시도할 바디 조합 (goodsNumber vs goodsNo, sortCode 등)
+            _candidates = [
+                {"goodsNumber": goods_no, "page": 1, "size": PAGE_SIZE, "reviewType": "ALL"},
+                {"goodsNumber": goods_no, "page": 1, "size": PAGE_SIZE},
+                {"goodsNo": goods_no, "page": 1, "size": PAGE_SIZE, "reviewType": "ALL"},
+            ]
+            if _sort_val:
+                _candidates.insert(0, {
+                    "goodsNumber": goods_no, "page": 1, "size": PAGE_SIZE,
+                    "reviewType": "ALL", "sortCode": _sort_val,
+                })
+
+            for _body in _candidates:
+                try:
+                    _r = session.post(_base, json=_body, headers=_hdr, timeout=15)
+                    log(f"🔎 전체리뷰[{_r.status_code}] {_base.split('/')[-1]}: "
+                        f"{html_lib.escape(_r.text[:80].replace(chr(10),' '))}")
+                    if _r.status_code == 200:
+                        _d = _r.json()
+                        _api_st = _d.get("status") if isinstance(_d, dict) else None
+                        if _api_st in ("NOT_FOUND", "BAD_REQUEST", "ERROR", "FAIL",
+                                       "METHOD_NOT_ALLOWED"):
+                            continue
+                        _revs: list = []
+                        _extract_from_json_structure(_d, _revs)
+                        if _revs:
+                            log(f"✅ 전체 리뷰 엔드포인트 성공! ({len(_revs)}개)")
+                            playwright_info["api_url"] = _base
+                            playwright_info["req_body"] = _body
+                            playwright_info["req_params"] = {}
+                            playwright_info["method"] = "POST"
+                            playwright_info["page_param"] = "page"
+                            page1_reviews = _revs
+                            working_endpoint = _base
+                            # 전체 수 재확인
+                            if isinstance(_d, dict):
+                                for _k in ("totalCnt", "totalCount", "total"):
+                                    if _d.get(_k):
+                                        try:
+                                            total_count = int(_d[_k])
+                                        except Exception:
+                                            pass
+                                        break
+                            break
+                except Exception as _e:
+                    log(f"⚠️ 전체리뷰 시도 오류: {str(_e)[:60]}")
+                    continue
     else:
         if playwright_info:
             log("⚠️ Playwright: API 발견했으나 리뷰 0개")
