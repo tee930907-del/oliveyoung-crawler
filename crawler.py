@@ -999,6 +999,19 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                     "li[data-value='NEW_REVIEW_DESC']", "button[value='NEW_REVIEW_DESC']",
                     "button:has-text('최신')", "a:has-text('최신')",
                 ]),
+                # 별점 필터: RATING_DESC/ASC가 못 건지는 중간 별점 리뷰 (3-4점) 추가 수집
+                ("별점4", [
+                    "button:has-text('4점')", "a:has-text('4점')",
+                    "li:has-text('4점') > a", "li:has-text('4점') > button",
+                    "[data-score='4']", "[data-rating='4']", "[data-star='4']",
+                    "label:has-text('4점')", "span.star4", "button.star-4",
+                ]),
+                ("별점3", [
+                    "button:has-text('3점')", "a:has-text('3점')",
+                    "li:has-text('3점') > a", "li:has-text('3점') > button",
+                    "[data-score='3']", "[data-rating='3']", "[data-star='3']",
+                    "label:has-text('3점')", "span.star3", "button.star-3",
+                ]),
             ]
             for _slabel, _selectors in _sort_labels:
                 if len(info["reviews"]) >= 2000:
@@ -1074,27 +1087,38 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                     _be = min(_bs + _BATCH, _pages_per_sort)
                     _pages = list(range(_bs, _be))
                     try:
-                        # credentials 없이 → CORS Allow-Origin:* 허용 (credentials:"include" 는 CORS TypeError)
-                        # context.request.post() 는 TLS 지문 달라 403 → page.evaluate fetch 사용
+                        # XMLHttpRequest + withCredentials: 페이지 자체 XHR 방식과 동일
+                        # fetch() CORS: 서버가 withCredentials 요청에만 Allow-Credentials:true 반환
+                        # fetch() without credentials → 서버가 CORS 헤더 미설정 → TypeError
+                        # XHR withCredentials=true → 서버가 Allow-Origin:www + Allow-Credentials:true 반환
                         _results = page.evaluate(
                             """async (args) => {
-                                const results = await Promise.all(args.pages.map(async p => {
-                                    try {
-                                        const r = await fetch(args.url, {
-                                            method: "POST",
-                                            headers: {"Content-Type": "application/json"},
-                                            body: JSON.stringify({
-                                                goodsNumber: args.goodsNo,
-                                                page: p,
-                                                size: args.size,
-                                                reviewType: "ALL",
-                                                sortType: args.sortType,
-                                            })
-                                        });
-                                        if (!r.ok) return {_httpStatus: r.status};
-                                        return await r.json();
-                                    } catch(e) { return {_error: String(e)}; }
-                                }));
+                                const results = await Promise.all(args.pages.map(p =>
+                                    new Promise((resolve) => {
+                                        const xhr = new XMLHttpRequest();
+                                        xhr.open("POST", args.url, true);
+                                        xhr.withCredentials = true;
+                                        xhr.setRequestHeader("Content-Type", "application/json");
+                                        xhr.onload = function() {
+                                            if (this.status === 200) {
+                                                try { resolve(JSON.parse(this.responseText)); }
+                                                catch(e) { resolve({_error: "parse:" + String(e)}); }
+                                            } else {
+                                                resolve({_httpStatus: this.status});
+                                            }
+                                        };
+                                        xhr.onerror = function() { resolve({_error: "XHR onerror"}); };
+                                        xhr.ontimeout = function() { resolve({_error: "XHR timeout"}); };
+                                        xhr.timeout = 10000;
+                                        xhr.send(JSON.stringify({
+                                            goodsNumber: args.goodsNo,
+                                            page: p,
+                                            size: args.size,
+                                            reviewType: "ALL",
+                                            sortType: args.sortType,
+                                        }));
+                                    })
+                                ));
                                 return results;
                             }""",
                             {"url": _CHECKSUM_URL, "goodsNo": _goods,
