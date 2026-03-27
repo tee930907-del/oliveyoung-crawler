@@ -44,11 +44,17 @@ _SORT_ORDER = {
 
 # 시도할 리뷰 API 엔드포인트 목록 (POST/GET 모두 시도)
 _REVIEW_ENDPOINTS = [
+    # Spring MVC .do 후보
     "https://www.oliveyoung.co.kr/store/goods/getGdasReviewList.do",
     "https://www.oliveyoung.co.kr/store/goods/getGoodsGdasList.do",
     "https://www.oliveyoung.co.kr/store/review/getReviewList.do",
     "https://www.oliveyoung.co.kr/store/goods/getGdasSearchList.do",
     "https://www.oliveyoung.co.kr/store/goods/getGoodsCriteriaReviewList.do",
+    # Next.js API Route 후보
+    "https://www.oliveyoung.co.kr/api/review/list",
+    "https://www.oliveyoung.co.kr/api/reviews",
+    "https://www.oliveyoung.co.kr/api/goods/review",
+    "https://www.oliveyoung.co.kr/api/goods/reviews",
 ]
 
 
@@ -287,8 +293,8 @@ def _try_review_api(
     return [], 0, None
 
 
-def _scan_js_for_review_api(session, html_text: str, log=None) -> str | None:
-    """JS 번들 파일에서 리뷰 API 엔드포인트 패턴 탐색"""
+def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=None) -> str | None:
+    """JS 번들 파일에서 리뷰 API 엔드포인트 탐색 (다양한 패턴)"""
     bundle_urls = []
 
     # CDN 번들
@@ -302,7 +308,7 @@ def _scan_js_for_review_api(session, html_text: str, log=None) -> str | None:
     for m in re.findall(r'"(/_next/static/[^"]+?\.js)"', html_text):
         bundle_urls.append(f"https://www.oliveyoung.co.kr{m}")
 
-    # 중복 제거 + 우선순위 정렬
+    # 중복 제거
     seen: set = set()
     unique: list = []
     for u in bundle_urls:
@@ -310,31 +316,58 @@ def _scan_js_for_review_api(session, html_text: str, log=None) -> str | None:
             seen.add(u)
             unique.append(u)
 
-    priority_kw = ['review', 'goods', 'detail', 'page', 'gdas']
-    priority = [u for u in unique if any(k in u.lower() for k in priority_kw)]
-    rest = [u for u in unique if u not in priority]
-    ordered = priority + rest
+    # RSC 스트림에서 모듈 ID 추출 → 해당 번들 우선
+    rsc_ids = set(re.findall(r'I\[(\d+),', rsc_text))
+    rsc_priority = [u for u in unique if any(f"/{i}" in u or f"-{i}" in u or f"{i}-" in u for i in rsc_ids)]
+    kw_priority = [u for u in unique if u not in rsc_priority and any(k in u.lower() for k in ['review', 'goods', 'gdas', 'detail'])]
+    rest = [u for u in unique if u not in rsc_priority and u not in kw_priority]
+    ordered = rsc_priority + kw_priority + rest
 
     if log:
-        log(f"ℹ️ JS 번들 {len(ordered)}개 탐색 시작...")
+        log(f"ℹ️ JS 번들 {len(ordered)}개 탐색 (RSC모듈 {len(rsc_ids)}개, 우선 {len(rsc_priority)}개)...")
 
-    review_api_re = re.compile(
-        r'["\`](/store/[^"\'`\s]{5,100}?(?:gdas|review|Review|Gdas)[^"\'`\s]*?\.do)["\`]',
-    )
+    # 다양한 URL 패턴
+    url_patterns = [
+        # Spring MVC .do
+        re.compile(r'["\`](/store/[^"\'`\s]{5,100}?(?:gdas|review|Review|Gdas)[^"\'`\s]*?\.do)["\`]'),
+        # Next.js API routes
+        re.compile(r'["\`](/api/[^"\'`\s]{3,100}?(?:review|gdas|Review|Gdas)[^"\'`\s]*)["\`]'),
+        # fetch() 호출
+        re.compile(r'fetch\s*\(\s*["\`]([^"\'`\s]+(?:review|gdas|Review|Gdas)[^"\'`\s]*)["\`]', re.IGNORECASE),
+        # 일반 경로 (review/gdas 세그먼트 포함)
+        re.compile(r'["\`]((?:/[a-zA-Z0-9_-]{1,40}){1,6}/(?:review|gdas)(?:s|List|[a-zA-Z0-9_-]*)?)["\`]', re.IGNORECASE),
+    ]
 
-    for url in ordered[:10]:
+    for url in ordered[:15]:
         try:
             resp = session.get(url, headers={"User-Agent": PC_UA, "Accept": "*/*"}, timeout=15)
             if resp.status_code != 200:
                 continue
-            matches = review_api_re.findall(resp.text)
-            if matches:
-                api_path = matches[0]
-                if log:
-                    log(f"🔑 JS 번들 API 발견: {api_path}")
-                return f"https://www.oliveyoung.co.kr{api_path}"
-        except Exception:
-            pass
+            bundle_text = resp.text
+
+            for p in url_patterns:
+                matches = p.findall(bundle_text)
+                for m in matches:
+                    if 'review' in m.lower() or 'gdas' in m.lower():
+                        full_url = m if m.startswith('http') else f"https://www.oliveyoung.co.kr{m}"
+                        if log:
+                            log(f"🔑 JS 번들 API 발견: {m}")
+                        return full_url
+
+            # 번들에서 review/gdas 관련 문자열 찾아 디버그 출력
+            if log:
+                fname = url.split('/')[-1][:25]
+                for kw in ['review', 'gdas', 'Review', 'GDAS']:
+                    idx = bundle_text.find(f'"{kw}')
+                    if idx < 0:
+                        idx = bundle_text.find(f'/{kw}')
+                    if idx >= 0:
+                        ctx = bundle_text[max(0, idx - 20):idx + 80].replace('\n', ' ')
+                        log(f"📦 [{fname}] {html_lib.escape(ctx[:90])}")
+                        break
+        except Exception as e:
+            if log:
+                log(f"⚠️ 번들 오류: {str(e)[:50]}")
 
     return None
 
@@ -418,6 +451,25 @@ def crawl_reviews(
         log("⚠️ 상품명 추출 실패")
     log(f"ℹ️ HTML 크기: {len(html_text)} chars")
 
+    # RSC 스트림 취득 (번들 탐색에서 모듈 ID 활용)
+    rsc_text = ""
+    try:
+        rsc_resp = session.get(
+            product_url,
+            headers={
+                "User-Agent": PC_UA,
+                "Accept": "text/x-component",
+                "RSC": "1",
+                "Accept-Language": "ko-KR,ko;q=0.9",
+            },
+            timeout=20,
+        )
+        if rsc_resp.status_code == 200:
+            rsc_text = rsc_resp.text
+            log(f"ℹ️ RSC 스트림: {len(rsc_text)} chars")
+    except Exception:
+        pass
+
     # ── 2. 리뷰 API 직접 호출 ──
     log("🔍 리뷰 API 호출 중...")
     progress(0.1)
@@ -432,7 +484,7 @@ def crawl_reviews(
         # JS 번들에서 엔드포인트 탐색
         log("⚠️ 기본 API 실패. JS 번들 탐색 중...")
         progress(0.2)
-        discovered_ep = _scan_js_for_review_api(session, html_text, log)
+        discovered_ep = _scan_js_for_review_api(session, html_text, rsc_text=rsc_text, log=log)
 
         if discovered_ep:
             page1_reviews, total_count, working_endpoint = _try_review_api(
