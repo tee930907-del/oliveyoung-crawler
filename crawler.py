@@ -997,12 +997,15 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
 
             # context.request.post() 사용: 브라우저 쿠키 공유 + CORS 우회 (Python측 HTTP 클라이언트)
             # page.evaluate() fetch는 cross-origin(www→m)에서 credentialed CORS가 차단되어 실패함
+            # 자연 XHR 캡처 헤더 재사용: sec-fetch-*, sec-ch-ua-*, accept 등 브라우저 지문 헤더 포함
             _req_hdrs = {
-                "Content-Type": "application/json",
-                "Referer": product_url,
-                "Origin": "https://www.oliveyoung.co.kr",
-                "User-Agent": PC_UA,
+                k: v for k, v in info.get("req_headers", {}).items()
+                if not k.startswith(":") and k.lower() not in ("content-length", "cookie")
             }
+            _req_hdrs["content-type"] = "application/json"
+            _req_hdrs.setdefault("referer", product_url)
+            _req_hdrs.setdefault("origin", "https://www.oliveyoung.co.kr")
+            _req_hdrs.setdefault("user-agent", PC_UA)
             if log:
                 log(f"🌐 브라우저 checksum fetch: p{_natural_start}~{_pages_per_sort} × "
                     f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개)...")
