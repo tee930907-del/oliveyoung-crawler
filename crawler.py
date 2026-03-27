@@ -1473,9 +1473,17 @@ def crawl_reviews(
             and "/checksum" in working_endpoint
             and len(all_reviews) < 500):   # 이미 충분하면 스킵
 
-        extra_sorts = ["NEW", "RATING_DESC", "RATING_ASC", "USEFUL_SCORE_ASC"]
+        # 확인된 유효: USEFUL_SCORE_DESC, RATING_DESC, RATING_ASC
+        # 확인된 무효 (BAD_REQUEST): NEW, USEFUL_SCORE_ASC
+        # "최신순" 후보들을 다 시도
+        extra_sorts = [
+            "RECENT", "REG_DT_DESC", "DATE_DESC", "LATEST", "REGIST_DATE_DESC",
+            "RATING_DESC", "RATING_ASC",
+        ]
         current_sort = (playwright_info.get("req_body") or {}).get("sortType", "")
-        extra_sorts = [s for s in extra_sorts if s != current_sort]
+        # 이미 알려진 무효 sortType 제외
+        _known_bad = {"NEW", "USEFUL_SCORE_ASC"}
+        extra_sorts = [s for s in extra_sorts if s != current_sort and s not in _known_bad]
 
         for extra_sort in extra_sorts:
             _extra_info = dict(playwright_info)
