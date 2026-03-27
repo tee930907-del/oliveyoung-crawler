@@ -995,19 +995,17 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                if r.get("content")}
             _fetch_failed = False
 
-            # 자연 XHR 캡처 헤더를 재사용 (쿠키 포함) → credentials: include 대신 명시적 헤더 전달
-            _captured_hdrs = info.get("req_headers", {})
-            _eval_hdrs = {
-                k: v for k, v in _captured_hdrs.items()
-                if not k.startswith(":") and k.lower() not in ("content-length",)
+            # context.request.post() 사용: 브라우저 쿠키 공유 + CORS 우회 (Python측 HTTP 클라이언트)
+            # page.evaluate() fetch는 cross-origin(www→m)에서 credentialed CORS가 차단되어 실패함
+            _req_hdrs = {
+                "Content-Type": "application/json",
+                "Referer": product_url,
+                "Origin": "https://www.oliveyoung.co.kr",
+                "User-Agent": PC_UA,
             }
-            # content-type은 항상 JSON으로 덮어씌움
-            _eval_hdrs["content-type"] = "application/json"
             if log:
-                _has_cookie = "cookie" in {k.lower() for k in _eval_hdrs}
                 log(f"🌐 브라우저 checksum fetch: p{_natural_start}~{_pages_per_sort} × "
-                    f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개, "
-                    f"쿠키포함={_has_cookie})...")
+                    f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개)...")
 
             for _sort in _FETCH_SORTS:
                 if len(_all_reviews_js) >= 2000:
@@ -1018,40 +1016,29 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                         break
                     _be = min(_bs + _BATCH, _pages_per_sort)
                     _pages = list(range(_bs, _be))
-                    try:
-                        _results = page.evaluate(
-                            """async (args) => {
-                                const results = await Promise.all(args.pages.map(async p => {
-                                    try {
-                                        const r = await fetch(args.url, {
-                                            method: "POST",
-                                            headers: args.headers,
-                                            body: JSON.stringify({
-                                                goodsNumber: args.goodsNo,
-                                                page: p,
-                                                size: args.size,
-                                                reviewType: "ALL",
-                                                sortType: args.sortType,
-                                            })
-                                        });
-                                        if (!r.ok) return {_httpStatus: r.status};
-                                        return await r.json();
-                                    } catch(e) { return {_error: String(e)}; }
-                                }));
-                                return results;
-                            }""",
-                            {"url": _CHECKSUM_URL, "goodsNo": _goods,
-                             "pages": _pages, "size": _SIZE, "sortType": _sort,
-                             "headers": _eval_hdrs},
-                        )
-                    except Exception as _fe:
-                        if log:
-                            log(f"⚠️ 브라우저 checksum 배치 오류 ({_sort}): {str(_fe)[:80]}")
-                        _fetch_failed = True
-                        break
+                    _results = []
+                    for _pnum in _pages:
+                        try:
+                            _resp = context.request.post(
+                                _CHECKSUM_URL,
+                                data=json.dumps({
+                                    "goodsNumber": _goods,
+                                    "page": _pnum,
+                                    "size": _SIZE,
+                                    "reviewType": "ALL",
+                                    "sortType": _sort,
+                                }),
+                                headers=_req_hdrs,
+                            )
+                            if _resp.ok:
+                                _results.append(_resp.json())
+                            else:
+                                _results.append({"_httpStatus": _resp.status})
+                        except Exception as _fe:
+                            _results.append({"_error": str(_fe)[:80]})
 
                     _empty_in_batch = 0
-                    for _res in (_results or []):
+                    for _res in _results:
                         if not isinstance(_res, dict):
                             _empty_in_batch += 1
                             continue
