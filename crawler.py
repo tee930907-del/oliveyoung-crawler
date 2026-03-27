@@ -266,34 +266,40 @@ def _try_review_api(
         {"goodsNo": goods_no, "pageIdx": page, "rowsPerPage": PAGE_SIZE},
     ]
 
+    # X-Requested-With 없는 헤더 변형도 시도 (일부 서버에서 CSRF 방어 우회)
+    ajax_no_xhr = {k: v for k, v in ajax_headers.items() if k not in ("X-Requested-With", "Content-Type")}
+    ajax_no_xhr["Accept"] = "application/json"
+
     # 엔드포인트당 첫 번째 응답만 로그 (노이즈 감소)
     logged_eps: set = set()
 
     for ep in endpoints_to_try:
         ep_label = ep.split("/")[-1]
         for params in param_sets:
-            # POST 시도
-            try:
-                resp = session.post(ep, data=params, headers=ajax_headers, timeout=15)
-                reviews, total = _parse_api_response(resp)
-                if reviews is not None:
-                    return reviews, total, ep
-                if log and page == 1 and ep not in logged_eps:
-                    logged_eps.add(ep)
-                    log(f"🔎 PC [{resp.status_code}] {ep_label}")
-            except Exception as e:
-                if log and page == 1 and ep not in logged_eps:
-                    logged_eps.add(ep)
-                    log(f"⚠️ PC 예외 {ep_label}: {str(e)[:50]}")
+            for h_post, h_get in [(ajax_headers, get_headers), (ajax_no_xhr, ajax_no_xhr)]:
+                # POST 시도
+                try:
+                    resp = session.post(ep, data=params, headers=h_post, timeout=15)
+                    reviews, total = _parse_api_response(resp)
+                    if reviews is not None:
+                        return reviews, total, ep
+                    if log and page == 1 and ep not in logged_eps:
+                        logged_eps.add(ep)
+                        preview = resp.text[:80].replace("\n", " ")
+                        log(f"🔎 PC [{resp.status_code}] {ep_label}: {html_lib.escape(preview)}")
+                except Exception as e:
+                    if log and page == 1 and ep not in logged_eps:
+                        logged_eps.add(ep)
+                        log(f"⚠️ PC 예외 {ep_label}: {str(e)[:50]}")
 
-            # GET 시도
-            try:
-                resp = session.get(ep, params=params, headers=get_headers, timeout=15)
-                reviews, total = _parse_api_response(resp)
-                if reviews is not None:
-                    return reviews, total, ep
-            except Exception:
-                pass
+                # GET 시도
+                try:
+                    resp = session.get(ep, params=params, headers=h_get, timeout=15)
+                    reviews, total = _parse_api_response(resp)
+                    if reviews is not None:
+                        return reviews, total, ep
+                except Exception:
+                    pass
 
     return [], 0, None
 
@@ -394,14 +400,12 @@ def _try_mobile_review_api(
     order = order_map.get(sort_code, "NEW")
     mobile_product_url = f"https://m.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={goods_no}"
 
-    # 모바일 세션 별도 생성 (모바일 쿠키 격리)
+    # 모바일 세션 별도 생성 (chrome 지문 사용 — safari_ios 미지원 환경 대비)
     if HAS_CURL_CFFI:
-        try:
-            msession = cf_requests.Session(impersonate="safari_ios17_2")
-        except Exception:
-            msession = cf_requests.Session(impersonate="chrome")
+        msession = cf_requests.Session(impersonate="chrome")
     else:
         msession = cf_requests.Session()
+        msession.headers.update({"User-Agent": MOBILE_UA})
 
     # 모바일 상품 페이지 방문 (m. 도메인 쿠키 획득)
     try:
