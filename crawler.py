@@ -510,6 +510,9 @@ def crawl_reviews(
     if total_count:
         log(f"📊 전체 리뷰 수: {total_count}개")
     log(f"📄 1페이지: HTML에서 {len(page1_reviews)}개 리뷰 파싱")
+    if page1_reviews:
+        sample = page1_reviews[0].get("content", "")[:60]
+        log(f"🔎 샘플 리뷰: {html_lib.escape(sample)}")
 
     # HTML 구조 디버그 (리뷰가 없을 때)
     if not page1_reviews:
@@ -525,7 +528,83 @@ def crawl_reviews(
 
     all_reviews = list(page1_reviews)
 
-    # 3. AJAX URL 발견 시 추가 페이지 수집
+    # 3. RSC 페이지네이션으로 추가 페이지 수집
+    if not ajax_url and page1_reviews:
+        log("📋 RSC 스트림 페이지네이션 시작...")
+        consecutive_empty = 0
+        rsc_page = 2
+
+        # 페이지 파라미터 후보 (첫 성공한 것을 계속 사용)
+        page_param_candidates = [
+            "reviewCurrentPage", "page", "reviewPage", "currentPage", "goodsReviewPage"
+        ]
+        working_param = None
+
+        while rsc_page <= max_pages:
+            page_reviews_found = False
+
+            # 파라미터 후보 순서대로 시도 (working_param 발견 시 고정)
+            params_to_try = [working_param] if working_param else page_param_candidates
+
+            for param_name in params_to_try:
+                try:
+                    paged_url = (
+                        f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
+                        f"?goodsNo={goods_no}&tab=review&{param_name}={rsc_page}"
+                    )
+                    pr = session.get(
+                        paged_url,
+                        headers={**BASE_HEADERS, "RSC": "1", "Accept": "text/x-component"},
+                        timeout=20,
+                    )
+                    if pr.status_code != 200:
+                        continue
+                    rsc_text = pr.text
+                    if len(rsc_text) < 1000:
+                        continue  # 너무 작으면 데이터 없음
+
+                    page_reviews = _parse_rsc_stream(rsc_text)
+                    # HTML 파서도 시도
+                    hr, _, _ = _parse_html_for_reviews(rsc_text)
+                    for r in hr:
+                        if r not in page_reviews:
+                            page_reviews.append(r)
+
+                    if page_reviews:
+                        working_param = param_name
+                        page_reviews_found = True
+
+                        before = len(all_reviews)
+                        for r in page_reviews:
+                            key = r.get("content", "")[:50]
+                            if not any(e.get("content", "")[:50] == key for e in all_reviews):
+                                all_reviews.append(r)
+                        new = len(all_reviews) - before
+
+                        if rsc_page <= 5 or rsc_page % 10 == 0:
+                            log(f"📄 RSC 페이지 {rsc_page}: 수집 {len(page_reviews)}개 | 신규 {new}개 | 누적 {len(all_reviews)}개")
+
+                        progress(0.2 + 0.75 * min(rsc_page / max_pages, 1.0))
+
+                        if new == 0:
+                            consecutive_empty += 1
+                        else:
+                            consecutive_empty = 0
+                        break
+                except Exception:
+                    continue
+
+            if not page_reviews_found:
+                consecutive_empty += 1
+
+            if consecutive_empty >= 3:
+                log(f"✅ RSC 페이지네이션 끝! (페이지 {rsc_page})")
+                break
+
+            rsc_page += 1
+            time.sleep(random.uniform(0.3, 0.7))
+
+    # 4. AJAX URL 발견 시 추가 페이지 수집
     if ajax_url and total_count > PAGE_SIZE:
         estimated_pages = min(max_pages, -(-total_count // PAGE_SIZE))
         log(f"📋 추가 페이지 수집 시작 (최대 {estimated_pages}페이지)...")
