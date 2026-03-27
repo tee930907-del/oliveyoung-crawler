@@ -335,26 +335,33 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
     """JS 번들 파일에서 리뷰 API 엔드포인트 탐색 (다양한 패턴)"""
     bundle_urls = []
 
-    # CDN 번들
+    # HTML에서 CDN 번들 추출
     cdn_matches = re.findall(
         r'https://cf-static\.oliveyoung\.co\.kr/[^\s"\'<>]+?\.js',
         html_text,
     )
     bundle_urls.extend(cdn_matches)
-
-    # 상대 경로 번들
     for m in re.findall(r'"(/_next/static/[^"]+?\.js)"', html_text):
         bundle_urls.append(f"https://www.oliveyoung.co.kr{m}")
 
-    # ★ Next.js buildManifest에서 페이지별 동적 청크 추가
-    # CDN 도메인 추출 (cf-static.oliveyoung.co.kr 등)
-    cdn_domain_m = re.search(r'(https://cf-static\.oliveyoung\.co\.kr)', html_text)
-    cdn_base = cdn_domain_m.group(1) if cdn_domain_m else "https://www.oliveyoung.co.kr"
+    # ★ RSC 스트림에서 직접 청크 경로 추출
+    # 형식: I[moduleId,["chunkId","static/chunks/xxx.js"],"ExportName"]
+    cdn_base = "https://cf-static.oliveyoung.co.kr"
+    for chunk_path in re.findall(r'"(static/chunks/[^"]+\.js)"', rsc_text):
+        for base in [cdn_base, "https://www.oliveyoung.co.kr"]:
+            full = f"{base}/{chunk_path}"
+            if full not in bundle_urls:
+                bundle_urls.append(full)
+    # RSC의 전체 CDN URL도 추출
+    for cdn_url in re.findall(r'https://cf-static\.oliveyoung\.co\.kr/[^\s"\'\\]+?\.js', rsc_text):
+        if cdn_url not in bundle_urls:
+            bundle_urls.append(cdn_url)
 
-    # buildId: CDN URL 패턴에서 추출
-    build_id_m = re.search(r'/_next/static/([a-zA-Z0-9_-]{10,50})/', html_text)
+    # buildId: RSC 또는 HTML에서 추출 후 buildManifest 로드
+    combined = rsc_text + html_text
+    build_id_m = re.search(r'/_next/static/([a-zA-Z0-9_-]{10,50})/', combined)
     if not build_id_m:
-        build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html_text)
+        build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', combined)
     if build_id_m:
         build_id = build_id_m.group(1)
         for manifest_url in [
