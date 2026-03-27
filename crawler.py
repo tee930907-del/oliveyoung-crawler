@@ -237,7 +237,16 @@ def crawl_reviews(
                     break
                 continue
 
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                if page_idx == 1:
+                    preview = resp.text[:300].replace("\n", " ").replace("\r", "")
+                    log(f"🔎 응답 미리보기 (HTML?): {preview}")
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+                continue
 
             # 1페이지 디버그
             if page_idx == 1:
