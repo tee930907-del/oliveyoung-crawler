@@ -261,8 +261,8 @@ def main():
 
         def on_log(msg):
             logs.append(msg)
-            # 최근 15개 로그만 표시
-            display_logs = logs[-15:]
+            # 최근 30개 로그 표시
+            display_logs = logs[-30:]
             log_html = "<br>".join(display_logs)
             log_area.markdown(
                 f'<div class="log-container">{log_html}</div>',

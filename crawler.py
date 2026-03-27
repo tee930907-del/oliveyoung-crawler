@@ -266,7 +266,11 @@ def _try_review_api(
         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "order": order},
     ]
 
+    # 엔드포인트당 첫 번째 응답만 로그 (노이즈 감소)
+    logged_eps: set = set()
+
     for ep in endpoints_to_try:
+        ep_label = ep.split("/")[-1]
         for params in param_sets:
             # POST 시도
             try:
@@ -274,12 +278,13 @@ def _try_review_api(
                 reviews, total = _parse_api_response(resp)
                 if reviews is not None:
                     return reviews, total, ep
-                if log and page == 1:
-                    preview = resp.text[:120].replace("\n", " ")
-                    log(f"🔎 POST {ep.split('/')[-1]} → HTTP {resp.status_code} | {html_lib.escape(preview)}")
+                if log and page == 1 and ep not in logged_eps:
+                    logged_eps.add(ep)
+                    log(f"🔎 PC [{resp.status_code}] {ep_label}")
             except Exception as e:
-                if log and page == 1:
-                    log(f"⚠️ POST {ep.split('/')[-1]} 예외: {str(e)[:60]}")
+                if log and page == 1 and ep not in logged_eps:
+                    logged_eps.add(ep)
+                    log(f"⚠️ PC 예외 {ep_label}: {str(e)[:50]}")
 
             # GET 시도
             try:
@@ -287,12 +292,8 @@ def _try_review_api(
                 reviews, total = _parse_api_response(resp)
                 if reviews is not None:
                     return reviews, total, ep
-                if log and page == 1:
-                    preview = resp.text[:120].replace("\n", " ")
-                    log(f"🔎 GET {ep.split('/')[-1]} → HTTP {resp.status_code} | {html_lib.escape(preview)}")
-            except Exception as e:
-                if log and page == 1:
-                    log(f"⚠️ GET {ep.split('/')[-1]} 예외: {str(e)[:60]}")
+            except Exception:
+                pass
 
     return [], 0, None
 
@@ -395,7 +396,10 @@ def _try_mobile_review_api(
 
     # 모바일 세션 별도 생성 (모바일 쿠키 격리)
     if HAS_CURL_CFFI:
-        msession = cf_requests.Session(impersonate="safari_ios17_2")
+        try:
+            msession = cf_requests.Session(impersonate="safari_ios17_2")
+        except Exception:
+            msession = cf_requests.Session(impersonate="chrome")
     else:
         msession = cf_requests.Session()
 
@@ -599,13 +603,18 @@ def crawl_reviews(
 
     # ── 2b. 모바일 API 폴백 ──
     if not working_endpoint:
-        log("🔍 모바일 API 시도 중...")
+        log("🔍 모바일 API 시도 중 (m.oliveyoung.co.kr)...")
         progress(0.35)
-        page1_reviews, total_count, working_endpoint = _try_mobile_review_api(
-            session, goods_no, 1, sort, log=log,
-        )
+        try:
+            page1_reviews, total_count, working_endpoint = _try_mobile_review_api(
+                session, goods_no, 1, sort, log=log,
+            )
+        except Exception as e:
+            log(f"❌ 모바일 API 예외: {str(e)[:80]}")
         if working_endpoint:
             log(f"✅ 모바일 API 성공: {working_endpoint.split('/')[-1]}")
+        else:
+            log("❌ 모바일 API도 실패")
 
     if total_count:
         log(f"📊 전체 리뷰 수: {total_count}개")
