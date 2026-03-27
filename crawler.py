@@ -992,6 +992,13 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                     "[data-sort-type='RATING_ASC']", "[data-sorttype='RATING_ASC']",
                     "li[data-value='RATING_ASC']", "button[value='RATING_ASC']",
                 ]),
+                ("NEW_REVIEW_DESC", [
+                    "button:has-text('최신순')", "button:has-text('최 신순')",
+                    "li:has-text('최신순') > a", "a:has-text('최신순')",
+                    "[data-sort-type='NEW_REVIEW_DESC']", "[data-sorttype='NEW_REVIEW_DESC']",
+                    "li[data-value='NEW_REVIEW_DESC']", "button[value='NEW_REVIEW_DESC']",
+                    "button:has-text('최신')", "a:has-text('최신')",
+                ]),
             ]
             for _slabel, _selectors in _sort_labels:
                 if len(info["reviews"]) >= 2000:
@@ -1041,10 +1048,13 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             _total = info.get("total", 0)
             # 정렬당 최대 페이지 수 (목표 2000개 → 3정렬 × ~67페이지)
             _pages_per_sort = min(70, (-(-_total // _SIZE) + 2)) if _total else 50
-            _FETCH_SORTS = ["USEFUL_SCORE_DESC", "RATING_DESC", "RATING_ASC"]
+            _FETCH_SORTS = ["USEFUL_SCORE_DESC", "RATING_DESC", "RATING_ASC", "NEW_REVIEW_DESC"]
 
             # 자연 XHR로 이미 수집한 리뷰 포함 시작 (dedup 포함)
-            _natural_start = info.get("natural_xhrs", 0)
+            # _natural_start: 정렬당 평균 자연 XHR 수 (전체 / 정렬 수)
+            # 전체 XHR 수를 정렬 수로 나눠 페이지 당 시작점 계산 (range가 비지 않도록)
+            _sort_count_for_scroll = 1 + len(_sort_labels)  # USEFUL_SCORE_DESC + 클릭 정렬 수
+            _natural_start = max(0, info.get("natural_xhrs", 0) // _sort_count_for_scroll)
             _all_reviews_js: list = list(info.get("reviews", []))
             _seen_keys: set = {r.get("content", "")[:50] for r in _all_reviews_js
                                if r.get("content")}
