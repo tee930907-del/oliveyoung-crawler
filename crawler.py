@@ -468,53 +468,54 @@ def _try_mobile_review_api(
                      "star_desc": "RATING_DESC", "star_asc": "RATING_ASC"}
     sort_orig = sort_map_orig.get(sort_code)
 
-    # (endpoint, method, origin, body) — origin=None이면 헤더 미포함
+    # (endpoint, method, origin, body, extra_headers) — extra_headers=None이면 기본만
     attempts = [
         # ★★ 원본 크롤러 파라미터 (goodsNumber + reviewType + page/size)
-        # v2 POST www origin
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          "https://www.oliveyoung.co.kr",
-         {**{"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
-          **({} if not sort_orig else {"sortType": sort_orig})}),
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
         # v2 POST no origin
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          None,
-         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
-        # ★★ v2 경로 패턴 — WAF 우회 확인됨, reviewType 추가
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
+
+        # ★★ v2 경로 패턴 — WAF 우회 확인됨
+        # 앱 전용 헤더 추가 시도 (BAD_REQUEST 원인 후보)
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
+         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
+         {"X-Channel-Gb": "M", "X-App-Gb": "A", "channelGb": "M"}),
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
-         {"page": page - 1, "size": PAGE_SIZE, "reviewType": "ALL"}),  # 0-indexed
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
-         "https://m.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
-        # v2 path + 추가 파라미터 조합
+         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
+         {"X-Requested-With": "co.oliveyoung.app"}),
+        # Chrome UA로 시도 (모바일 UA가 차단되는지 확인)
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
-         {"pageNum": page, "pageSize": PAGE_SIZE, "reviewType": "ALL"}),
+         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
+         {"User-Agent": PC_UA}),
+        # www 도메인으로 시도
+        (f"https://www.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
+        # Next.js API 라우트 가능성
+        (f"https://www.oliveyoung.co.kr/api/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE}, None),
+        (f"https://www.oliveyoung.co.kr/api/review", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE}, None),
+        # v2 path 기본
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE}),
-        # v1 (JSON 응답 확인됨 — NOT_FOUND이지만 원본 파라미터로 재시도)
+         {"page": page, "size": PAGE_SIZE}, None),
+        # v1
         ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
          "https://m.oliveyoung.co.kr",
-         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
-        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
-         "https://m.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
     ]
 
-    # RSC에서 찾은 대체 goodsNo로 v1 추가 시도
-    for alt_id in rsc_ids[:3]:
-        attempts.append((
-            "https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
-            "https://m.oliveyoung.co.kr",
-            {"goodsNo": alt_id, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order},
-        ))
-
-    for api_url, method, origin, body in attempts:
+    for api_url, method, origin, body, extra_h in attempts:
         h = {
             "User-Agent": MOBILE_UA,
             "Accept": "application/json, text/plain, */*",
@@ -524,6 +525,8 @@ def _try_mobile_review_api(
         }
         if origin:
             h["Origin"] = origin
+        if extra_h:
+            h.update(extra_h)
 
         try:
             if method == "POST":
@@ -675,6 +678,16 @@ def crawl_reviews(
         if rsc_resp.status_code == 200:
             rsc_text = rsc_resp.text
             log(f"ℹ️ RSC 스트림: {len(rsc_text)} chars")
+            # RSC 내 API URL 패턴 탐색
+            for pat in [
+                r'(https?://[^\s"\'\\]+/review[^\s"\'\\]{0,80})',
+                r'(https?://[^\s"\'\\]+/api[^\s"\'\\]{0,80})',
+                r'"(/(?:api|review)/[^\s"\'\\]{3,80})"',
+            ]:
+                found = re.findall(pat, rsc_text)
+                if found:
+                    log(f"🔑 RSC API 힌트: {found[:3]}")
+                    break
     except Exception:
         pass
 
