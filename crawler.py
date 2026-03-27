@@ -33,7 +33,6 @@ PC_UA = (
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "Origin": "https://www.oliveyoung.co.kr",
     "Referer": "https://www.oliveyoung.co.kr/",
     "User-Agent": PC_UA,
@@ -214,7 +213,7 @@ def crawl_reviews(
     sort = sort_type or "date"
 
     for page_idx in range(1, max_pages + 1):
-        form_data = {
+        params = {
             "goodsNo": goods_no,
             "pagingIndex": str(page_idx),
             "pagingSize": str(PAGE_SIZE),
@@ -222,9 +221,9 @@ def crawl_reviews(
         }
 
         try:
-            resp = session.post(
+            resp = session.get(
                 GDAS_API_URL,
-                data=form_data,
+                params=params,
                 timeout=15,
                 headers=HEADERS,
             )
@@ -241,8 +240,10 @@ def crawl_reviews(
                 data = resp.json()
             except Exception:
                 if page_idx == 1:
-                    preview = resp.text[:300].replace("\n", " ").replace("\r", "")
-                    log(f"🔎 응답 미리보기 (HTML?): {preview}")
+                    import html as html_lib
+                    raw = resp.text[:400].replace("\n", " ").replace("\r", "")
+                    preview = html_lib.escape(raw)
+                    log(f"🔎 응답(HTML이스케이프): {preview}")
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
                     break
