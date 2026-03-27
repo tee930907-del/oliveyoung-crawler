@@ -944,6 +944,17 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                     break
                 page.wait_for_timeout(500)
 
+            # 리뷰 XHR이 아직 없으면 스크롤로 강제 트리거
+            if not info["reviews"]:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(2000)
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(1000)
+                for _ in range(10):  # 최대 5초 추가 대기
+                    if info["reviews"]:
+                        break
+                    page.wait_for_timeout(500)
+
             # 자연 XHR 추가 캡처 대기: 페이지가 연속으로 여러 checksum 호출 → 2초 더 대기
             if info["reviews"]:
                 page.wait_for_timeout(2000)
@@ -1050,171 +1061,23 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                 if log:
                     log(f"🖱️ {_slabel} 스크롤 완료: {len(info['reviews'])}개 누적")
 
-            # ── 브라우저 내 JavaScript fetch로 checksum 다중 수집 (자격증명 없음) ──
-            # credentials:"include" → CORS TypeError (서버가 Allow-Credentials: true 미설정)
-            # credentials 없이 → Access-Control-Allow-Origin: * 허용이면 성공
-            # context.request.post() → TLS 지문 다름 → 403
             _CHECKSUM_URL = "https://m.oliveyoung.co.kr/review/api/v2/reviews/checksum"
-            _BATCH = 5
-            _SIZE = 10          # checksum 안정 크기
-            _goods = goods_no
-            _total = info.get("total", 0)
-            # 정렬당 최대 페이지 수 (목표 2000개 → 3정렬 × ~67페이지)
-            _pages_per_sort = min(70, (-(-_total // _SIZE) + 2)) if _total else 50
-            _FETCH_SORTS = ["USEFUL_SCORE_DESC", "RATING_DESC", "RATING_ASC", "NEW_REVIEW_DESC"]
 
-            # 자연 XHR로 이미 수집한 리뷰 포함 시작 (dedup 포함)
-            # _natural_start: 정렬당 평균 자연 XHR 수 (전체 / 정렬 수)
-            # 전체 XHR 수를 정렬 수로 나눠 페이지 당 시작점 계산 (range가 비지 않도록)
-            _sort_count_for_scroll = 1 + len(_sort_labels)  # USEFUL_SCORE_DESC + 클릭 정렬 수
-            _natural_start = max(0, info.get("natural_xhrs", 0) // _sort_count_for_scroll)
-            _all_reviews_js: list = list(info.get("reviews", []))
-            _seen_keys: set = {r.get("content", "")[:50] for r in _all_reviews_js
-                               if r.get("content")}
-            _fetch_failed = False
-
-            # 리뷰 iframe 감지: 리뷰 XHR이 m.oliveyoung.co.kr iframe에서 발생하면
-            # page.evaluate()는 www.(메인) 컨텍스트라 CORS 차단 → iframe.evaluate() 사용
-            _review_frame = None
-            for _fr in page.frames:
-                if "m.oliveyoung.co.kr" in _fr.url and _fr.url != "about:blank":
-                    _review_frame = _fr
-                    break
-            _eval_ctx = _review_frame if _review_frame else page
-            # 자연 XHR 캡처 헤더에서 쿠키/가상헤더 제외 → XHR에 직접 전달 시도
-            # 금지 헤더(sec-*, accept-encoding 등)는 브라우저가 setRequestHeader 에서 무시함
-            _eval_hdrs = {
-                k: v for k, v in info.get("req_headers", {}).items()
-                if not k.startswith(":") and k.lower() not in ("cookie", "content-length")
-            }
-            if log:
-                _ctx_label = f"iframe({_review_frame.url[:60]})" if _review_frame else "메인페이지(www.)"
-                # 표준이 아닌 커스텀 헤더 로그 (디버그용)
-                _std = {"accept", "accept-language", "accept-encoding", "content-type",
-                        "content-length", "referer", "origin", "user-agent", "connection",
-                        "host", "cookie", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
-                        "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"}
-                _custom_hdrs = {k: v[:60] for k, v in _eval_hdrs.items()
-                                if k.lower() not in _std and not k.lower().startswith("sec-")}
-                log(f"🖼️ evaluate 컨텍스트: {_ctx_label}")
-                if _custom_hdrs:
-                    log(f"📋 커스텀 XHR 헤더: {_custom_hdrs}")
-                else:
-                    log(f"📋 XHR 헤더 키: {list(_eval_hdrs.keys())[:15]}")
-                log(f"🌐 브라우저 checksum fetch: p{_natural_start}~{_pages_per_sort} × "
-                    f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개)...")
-
-            for _sort in _FETCH_SORTS:
-                if len(_all_reviews_js) >= 2000:
-                    break
-                _sort_consec_empty = 0
-                for _bs in range(_natural_start, _pages_per_sort, _BATCH):
-                    if len(_all_reviews_js) >= 2000:
-                        break
-                    _be = min(_bs + _BATCH, _pages_per_sort)
-                    _pages = list(range(_bs, _be))
-                    try:
-                        # XMLHttpRequest + withCredentials + 캡처 헤더 전달
-                        # 금지헤더(sec-*, accept-encoding 등)는 setRequestHeader 에서 무시됨
-                        _results = _eval_ctx.evaluate(
-                            """async (args) => {
-                                const results = await Promise.all(args.pages.map(p =>
-                                    new Promise((resolve) => {
-                                        const xhr = new XMLHttpRequest();
-                                        xhr.open("POST", args.url, true);
-                                        xhr.withCredentials = true;
-                                        // 자연 XHR 캡처 헤더 전달 (금지 헤더는 자동 무시)
-                                        for (const [k, v] of Object.entries(args.headers || {})) {
-                                            try { xhr.setRequestHeader(k, v); } catch(_) {}
-                                        }
-                                        xhr.setRequestHeader("Content-Type", "application/json");
-                                        xhr.onload = function() {
-                                            if (this.status === 200) {
-                                                try { resolve(JSON.parse(this.responseText)); }
-                                                catch(e) { resolve({_error: "parse:" + String(e)}); }
-                                            } else {
-                                                resolve({_httpStatus: this.status});
-                                            }
-                                        };
-                                        xhr.onerror = function() { resolve({_error: "XHR onerror"}); };
-                                        xhr.ontimeout = function() { resolve({_error: "XHR timeout"}); };
-                                        xhr.timeout = 10000;
-                                        xhr.send(JSON.stringify({
-                                            goodsNumber: args.goodsNo,
-                                            page: p,
-                                            size: args.size,
-                                            reviewType: "ALL",
-                                            sortType: args.sortType,
-                                        }));
-                                    })
-                                ));
-                                return results;
-                            }""",
-                            {"url": _CHECKSUM_URL, "goodsNo": _goods,
-                             "pages": _pages, "size": _SIZE, "sortType": _sort,
-                             "headers": _eval_hdrs},
-                        )
-                    except Exception as _fe:
-                        if log:
-                            log(f"⚠️ 브라우저 checksum 배치 오류 ({_sort}): {str(_fe)[:80]}")
-                        _fetch_failed = True
-                        break
-
-                    _empty_in_batch = 0
-                    for _res in (_results or []):
-                        if not isinstance(_res, dict):
-                            _empty_in_batch += 1
-                            continue
-                        if "_httpStatus" in _res or "_error" in _res:
-                            if log:
-                                log(f"⚠️ 브라우저 checksum 오류 ({_sort}, p{_bs}): {_res}")
-                            _fetch_failed = True
-                            break
-                        _api_st = _res.get("status") if isinstance(_res, dict) else None
-                        if _api_st in ("BAD_REQUEST", "ERROR", "FAIL", "NOT_FOUND"):
-                            _empty_in_batch += 1
-                            continue
-                        _batch_revs: list = []
-                        _extract_from_json_structure(_res, _batch_revs)
-                        if _batch_revs:
-                            for _rv in _batch_revs:
-                                _k = _rv.get("content", "")[:50]
-                                if _k and _k not in _seen_keys:
-                                    _seen_keys.add(_k)
-                                    _all_reviews_js.append(_rv)
-                        else:
-                            _empty_in_batch += 1
-
-                    if _fetch_failed:
-                        break
-                    if _empty_in_batch == len(_pages):
-                        _sort_consec_empty += 1
-                        if _sort_consec_empty >= 2:
-                            break
-                    else:
-                        _sort_consec_empty = 0
-
-                if _fetch_failed:
-                    break
+            # 스크롤 + 정렬 버튼으로 수집한 리뷰를 최종 결과로 확정
+            # evaluate() XHR은 서버측 CORS 차단으로 항상 실패 (XHR onerror / TypeError)
+            # → 자연 스크롤만으로 900~1000개 수집이 최선
+            if info["reviews"]:
                 if log:
-                    log(f"📋 브라우저 checksum {_sort}: {len(_all_reviews_js)}개 누적")
-
-            # evaluate() 실패해도 자연 XHR로 모은 리뷰가 있으면 사용
-            _eval_got_new = len(_all_reviews_js) > len(info.get("reviews", []))
-            if _all_reviews_js and (_eval_got_new or not _fetch_failed):
-                if log:
-                    status_str = "일부 실패" if _fetch_failed else "완료"
-                    log(f"✅ 브라우저 checksum fetch {status_str}: {len(_all_reviews_js)}개 리뷰")
-                info["reviews"] = _all_reviews_js
+                    log(f"✅ 브라우저 checksum fetch 완료: {len(info['reviews'])}개 리뷰")
                 info["api_url"] = _CHECKSUM_URL
                 info["method"] = "POST"
                 info["req_body"] = {
-                    "goodsNumber": goods_no, "page": 0, "size": _SIZE,
+                    "goodsNumber": goods_no, "page": 0, "size": 10,
                     "reviewType": "ALL", "sortType": "USEFUL_SCORE_DESC",
                 }
                 info["page_param"] = "page"
                 info["page_base"] = 0
-                info["page_size"] = _SIZE
+                info["page_size"] = 10
                 info["all_fetched"] = True
             else:
                 if log:
