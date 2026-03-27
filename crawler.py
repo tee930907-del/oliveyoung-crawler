@@ -125,7 +125,9 @@ def extract_reviews_from_json(data, depth=0):
     if isinstance(data, dict):
         for key in [
             "reviewList", "reviews", "list", "data", "items", "contents",
-            "gdasList", "commentList", "content", "result", "body", "payload"
+            "gdasList", "commentList", "content", "result", "body", "payload",
+            "goodsReviewList", "reviewDtoList", "reviewVoList", "dataList",
+            "totalReviewList", "reviewInfo", "response",
         ]:
             if key in data:
                 val = data[key]
@@ -302,9 +304,12 @@ def crawl_reviews(
 
     for page_idx in range(1, max_pages + 1):
         req_body = {
+            "goodsNo": goods_no,
             "goodsNumber": goods_no,
             "page": page_idx,
+            "pageNo": page_idx,
             "size": PAGE_SIZE,
+            "pageSize": PAGE_SIZE,
             "reviewType": "ALL",
         }
         if sort_type:
@@ -328,10 +333,18 @@ def crawl_reviews(
 
             data = resp.json()
 
-            # API 에러 체크
-            if data.get("status") != "SUCCESS":
+            # 1페이지에서 응답 구조 디버그 출력
+            if page_idx == 1:
+                top_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+                log(f"🔎 API 응답 키: {top_keys}")
+                raw_preview = str(data)[:300]
+                log(f"🔎 응답 미리보기: {raw_preview}")
+
+            # API 에러 체크 (status 또는 resultCode 필드 모두 허용)
+            status_val = data.get("status") or data.get("resultCode") or data.get("code")
+            if status_val and str(status_val).upper() not in ("SUCCESS", "200", "OK", "0", "00"):
                 consecutive_empty += 1
-                msg = data.get("message", "알 수 없는 오류")
+                msg = data.get("message") or data.get("msg") or data.get("resultMessage") or "알 수 없는 오류"
                 log(f"⚠️ 페이지 {page_idx}: {msg}")
                 if consecutive_empty >= 3:
                     break
