@@ -502,11 +502,35 @@ def _try_mobile_review_api(
         (f"https://m.oliveyoung.co.kr/review/api/v1/reviews/{goods_no_num}", "GET",
          "https://m.oliveyoung.co.kr",
          {"pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v2 경로 패턴: /reviews/{goodsNo}
+        # ★★ v2 경로 패턴 — BAD_REQUEST 확인됨, 파라미터 변형 집중 시도
+        # 파라미터 없이 → 어떤 필드가 필요한지 확인
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {}),
+        # page/size 형식
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE, "sort": order}),
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"page": page - 1, "size": PAGE_SIZE}),  # 0-indexed
+        # pageNo/pageSize 형식
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"pageNo": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        # pageNum/pageSize (기존)
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
          {"pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v2 + m origin
+        # POST로도 시도
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "POST",
+         "https://www.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE, "sort": order}),
+        # m origin으로 path 시도
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://m.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE}),
+        # v2 POST (body)
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          "https://m.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
@@ -551,9 +575,9 @@ def _try_mobile_review_api(
                 if text.startswith(("{", "[")):
                     data = resp.json()
                     # NOT_FOUND 같은 에러 응답 건너뜀
-                    if isinstance(data, dict) and data.get("status") in ("NOT_FOUND", "ERROR", "FAIL"):
+                    if isinstance(data, dict) and data.get("status") in ("NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST"):
                         if log and page == 1:
-                            log(f"ℹ️ 모바일 API error: {data.get('message','')[:60]}")
+                            log(f"ℹ️ {data.get('status')} [{label}]: {data.get('message','')[:80]}")
                         continue
                     reviews: list = []
                     _extract_from_json_structure(data, reviews)
