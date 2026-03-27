@@ -1454,6 +1454,69 @@ def crawl_reviews(
 
             time.sleep(random.uniform(0.3, 0.7))
 
+    # ── 4. checksum 다중 정렬 수집 (CORS로 /reviews 차단 → 여러 sortType으로 커버) ──
+    # checksum 엔드포인트는 sortType당 ~385개 반환. 4가지 정렬로 최대 ~1200개 unique.
+    if (use_playwright_replay and playwright_info
+            and "/checksum" in working_endpoint
+            and len(all_reviews) < 500):   # 이미 충분하면 스킵
+
+        extra_sorts = ["NEW", "RATING_DESC", "RATING_ASC", "USEFUL_SCORE_ASC"]
+        current_sort = (playwright_info.get("req_body") or {}).get("sortType", "")
+        extra_sorts = [s for s in extra_sorts if s != current_sort]
+
+        for extra_sort in extra_sorts:
+            _extra_info = dict(playwright_info)
+            _extra_body = dict(playwright_info.get("req_body") or {})
+            _extra_body["sortType"] = extra_sort
+            _extra_info["req_body"] = _extra_body
+
+            log(f"🔄 추가 수집: sortType={extra_sort}...")
+            before_extra = len(all_reviews)
+            consecutive_extra = 0
+
+            for page_idx in range(0, 60):  # 0-indexed, max 60 pages
+                _extra_body_page = dict(_extra_body)
+                _extra_body_page["page"] = page_idx
+                if playwright_info.get("page_size"):
+                    _extra_body_page["size"] = playwright_info["page_size"]
+
+                _hdr_e = {
+                    k: v for k, v in playwright_info.get("req_headers", {}).items()
+                    if k.lower() not in (":method", ":path", ":scheme", ":authority",
+                                         "content-length", "transfer-encoding")
+                }
+                try:
+                    _re = session.post(working_endpoint, json=_extra_body_page,
+                                       headers=_hdr_e, timeout=15)
+                    if _re.status_code != 200:
+                        break
+                    _de = _re.json()
+                    _api_st = _de.get("status") if isinstance(_de, dict) else None
+                    if _api_st in ("NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST"):
+                        break
+                    _page_revs: list = []
+                    _extract_from_json_structure(_de, _page_revs)
+                    if not _page_revs:
+                        consecutive_extra += 1
+                        if consecutive_extra >= 2:
+                            break
+                        continue
+                    consecutive_extra = 0
+                    new_e = 0
+                    for r in _page_revs:
+                        key = r.get("content", "")[:50]
+                        if not any(e.get("content", "")[:50] == key for e in all_reviews):
+                            all_reviews.append(r)
+                            new_e += 1
+                    time.sleep(random.uniform(0.2, 0.5))
+                except Exception:
+                    break
+
+            added = len(all_reviews) - before_extra
+            log(f"📄 {extra_sort}: +{added}개 추가 (누적 {len(all_reviews)}개)")
+            if added == 0:
+                break  # 더 이상 새 리뷰 없으면 다음 정렬도 스킵
+
     all_reviews = deduplicate_reviews(all_reviews)
     progress(1.0)
     log(f"🎉 수집 완료! 총 {len(all_reviews)}개 리뷰")
