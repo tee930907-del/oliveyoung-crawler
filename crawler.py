@@ -47,7 +47,6 @@ _SORT_ORDER = {
 }
 
 # 시도할 리뷰 API 엔드포인트 목록
-# 커뮤니티 역공학 결과: /store/product/ 경로 + pageIdx/rowsPerPage/sortCode 파라미터
 _REVIEW_ENDPOINTS = [
     # ★ 핵심: /store/product/ 경로 (pageIdx/rowsPerPage/sortCode 파라미터)
     "https://www.oliveyoung.co.kr/store/product/getGdasReviewList.do",
@@ -228,6 +227,26 @@ def _parse_api_response(resp) -> tuple[list[dict] | None, int]:
     return reviews, total
 
 
+def _extract_csrf(html_text: str, cookies) -> str | None:
+    """HTML/쿠키에서 Spring Security CSRF 토큰 추출"""
+    # 1. <meta name="_csrf" content="..."> 패턴
+    m = re.search(r'<meta\s+name=["\']_csrf["\']\s+content=["\']([^"\']+)["\']', html_text)
+    if m:
+        return m.group(1)
+    # 2. JS 변수: _csrf:"token" 또는 csrfToken:"token"
+    m = re.search(r'(?:_csrf|csrfToken|csrf_token)["\s:]+["\']([a-zA-Z0-9\-_]{20,})["\']', html_text)
+    if m:
+        return m.group(1)
+    # 3. 쿠키: XSRF-TOKEN
+    try:
+        for c in cookies:
+            if c.name in ("XSRF-TOKEN", "_csrf", "CSRF-TOKEN"):
+                return c.value
+    except Exception:
+        pass
+    return None
+
+
 def _try_review_api(
     session,
     goods_no: str,
@@ -235,6 +254,7 @@ def _try_review_api(
     sort_code: str,
     referer: str,
     endpoint: str | None = None,
+    html_text: str = "",
     log=None,
 ) -> tuple[list[dict], int, str | None]:
     """
@@ -243,6 +263,11 @@ def _try_review_api(
     Returns (reviews, total_count, working_endpoint)
     """
     order = _SORT_ORDER.get(sort_code, "NEW")
+
+    # CSRF 토큰 추출
+    csrf_token = _extract_csrf(html_text, getattr(session, "cookies", []))
+    if csrf_token and log and page == 1:
+        log(f"ℹ️ CSRF 토큰 발견: {csrf_token[:16]}...")
 
     ajax_headers = {
         "User-Agent": PC_UA,
@@ -253,6 +278,8 @@ def _try_review_api(
         "Referer": referer,
         "Origin": "https://www.oliveyoung.co.kr",
     }
+    if csrf_token:
+        ajax_headers["X-CSRF-TOKEN"] = csrf_token
     get_headers = {k: v for k, v in ajax_headers.items() if k != "Content-Type"}
 
     endpoints_to_try = [endpoint] if endpoint else _REVIEW_ENDPOINTS
@@ -266,7 +293,7 @@ def _try_review_api(
         {"goodsNo": goods_no, "pageIdx": page, "rowsPerPage": PAGE_SIZE},
     ]
 
-    # X-Requested-With 없는 헤더 변형도 시도 (일부 서버에서 CSRF 방어 우회)
+    # X-Requested-With 없는 헤더 변형도 시도
     ajax_no_xhr = {k: v for k, v in ajax_headers.items() if k not in ("X-Requested-With", "Content-Type")}
     ajax_no_xhr["Accept"] = "application/json"
 
@@ -391,6 +418,7 @@ def _try_mobile_review_api(
     page: int,
     sort_code: str,
     log=None,
+    rsc_text: str = "",
 ) -> tuple[list[dict], int, str | None]:
     """
     m.oliveyoung.co.kr 모바일 리뷰 API 시도.
@@ -417,50 +445,102 @@ def _try_mobile_review_api(
     except Exception:
         pass
 
-    mobile_headers = {
-        "User-Agent": MOBILE_UA,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9",
-        "Referer": mobile_product_url,
-        "Origin": "https://m.oliveyoung.co.kr",
-        "Content-Type": "application/json",
-    }
+    # goodsNo 변형 (A + 12자리 숫자 → 숫자만, 또는 그대로)
+    goods_no_num = goods_no[1:] if goods_no.startswith("A") else goods_no
 
-    # (endpoint, method, body) 조합 시도
+    # RSC 스트림에서 다른 goodsNo 형식 탐색 (예: 소문자 a, 다른 접두어 등)
+    rsc_ids: list[str] = []
+    if rsc_text:
+        # RSC 데이터에서 goodsNo 패턴 탐색
+        for pat in [
+            r'"goodsNo"\s*:\s*"([^"]{6,20})"',
+            r'"goodsCd"\s*:\s*"([^"]{6,20})"',
+            r'"itemNo"\s*:\s*"([^"]{6,20})"',
+        ]:
+            for m in re.findall(pat, rsc_text):
+                if m not in rsc_ids and m != goods_no:
+                    rsc_ids.append(m)
+        if rsc_ids and log and page == 1:
+            log(f"ℹ️ RSC 내 상품ID 변형: {rsc_ids[:5]}")
+
+    # (endpoint, method, origin, body) — origin=None이면 헤더 미포함
     attempts = [
+        # ★ v2 + www origin (이전에 data:[] JSON 응답 확인됨 — 파라미터 변형 시도)
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+         "https://www.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
-         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "sortType": order}),
+         "https://www.oliveyoung.co.kr",
+         {"goodsNo": goods_no, "pageIdx": page, "rowsPerPage": PAGE_SIZE, "sortCode": order}),
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+         "https://www.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE}),
+        # v2 GET + www origin (POST가 빈 배열 반환 → GET도 시도)
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "GET",
+         "https://www.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        # v2 + no origin
+        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+         None,
+         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        # v1 + m origin (JSON 응답 확인됨 — NOT_FOUND → 파라미터/ID 변형)
         ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
+         "https://m.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        ("https://m.oliveyoung.co.kr/store/goods/getGdasReviewList.do", "POST",
-         {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE, "order": order}),
+        # v1 + goodsNo 숫자만 (A 제거)
+        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
+         "https://m.oliveyoung.co.kr",
+         {"goodsNo": goods_no_num, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        # v1 GET
+        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "GET",
+         "https://m.oliveyoung.co.kr",
+         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        # v2 + m origin (403이지만 혹시 쿠키 있을 때 달라질 수도)
+        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+         "https://m.oliveyoung.co.kr",
+         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
     ]
 
-    for api_url, method, body in attempts:
-        h = dict(mobile_headers)
-        if method == "GET":
-            h.pop("Content-Type", None)
+    # RSC에서 찾은 대체 goodsNo로 v1 추가 시도
+    for alt_id in rsc_ids[:3]:
+        attempts.append((
+            "https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
+            "https://m.oliveyoung.co.kr",
+            {"goodsNo": alt_id, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order},
+        ))
+
+    for api_url, method, origin, body in attempts:
+        h = {
+            "User-Agent": MOBILE_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+            "Referer": mobile_product_url,
+            "Content-Type": "application/json",
+        }
+        if origin:
+            h["Origin"] = origin
+
         try:
             if method == "POST":
                 resp = msession.post(api_url, json=body, headers=h, timeout=15)
             else:
+                h.pop("Content-Type", None)
                 resp = msession.get(api_url, params=body, headers=h, timeout=15)
 
             if log and page == 1:
                 preview = resp.text[:160].replace("\n", " ")
-                label = api_url.split("/")[-1]
-                log(f"🔎 모바일[{resp.status_code}] {method} {label}: {html_lib.escape(preview[:120])}")
+                label = f"v{'2' if 'v2' in api_url else '1'} origin={origin.split('.')[-2] if origin else 'none'}"
+                log(f"🔎 모바일[{resp.status_code}] {label}: {html_lib.escape(preview[:100])}")
 
             if resp.status_code == 200:
                 text = resp.text.lstrip()
                 if text.startswith(("{", "[")):
                     data = resp.json()
+                    # NOT_FOUND 같은 에러 응답 건너뜀
+                    if isinstance(data, dict) and data.get("status") in ("NOT_FOUND", "ERROR", "FAIL"):
+                        if log and page == 1:
+                            log(f"ℹ️ 모바일 API error: {data.get('message','')[:60]}")
+                        continue
                     reviews: list = []
                     _extract_from_json_structure(data, reviews)
                     total = 0
@@ -473,7 +553,7 @@ def _try_mobile_review_api(
                                 except Exception:
                                     pass
                         if log and page == 1 and not reviews:
-                            log(f"ℹ️ 모바일 JSON 응답 키: {list(data.keys())[:8]}")
+                            log(f"ℹ️ 모바일 JSON 키: {list(data.keys())[:8]} | data={str(data.get('data'))[:60]}")
                     if reviews:
                         return reviews, total, api_url
         except Exception as e:
@@ -586,7 +666,7 @@ def crawl_reviews(
     progress(0.1)
 
     page1_reviews, total_count, working_endpoint = _try_review_api(
-        session, goods_no, 1, sort, product_url, log=log,
+        session, goods_no, 1, sort, product_url, html_text=html_text, log=log,
     )
 
     if working_endpoint:
@@ -600,7 +680,7 @@ def crawl_reviews(
         if discovered_ep:
             page1_reviews, total_count, working_endpoint = _try_review_api(
                 session, goods_no, 1, sort, product_url,
-                endpoint=discovered_ep, log=log,
+                endpoint=discovered_ep, html_text=html_text, log=log,
             )
             if working_endpoint:
                 log(f"✅ JS 번들 API 성공: {working_endpoint.split('/')[-1]}")
@@ -611,7 +691,7 @@ def crawl_reviews(
         progress(0.35)
         try:
             page1_reviews, total_count, working_endpoint = _try_mobile_review_api(
-                session, goods_no, 1, sort, log=log,
+                session, goods_no, 1, sort, log=log, rsc_text=rsc_text,
             )
         except Exception as e:
             log(f"❌ 모바일 API 예외: {str(e)[:80]}")
