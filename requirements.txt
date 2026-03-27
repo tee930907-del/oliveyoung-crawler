@@ -2,3 +2,4 @@ streamlit
 pandas
 openpyxl
 curl_cffi
+playwright

@@ -1,14 +1,15 @@
 """
 올리브영 리뷰 크롤러 - Streamlit Cloud 배포용
-전략: PC GDAS API 직접 호출 (curl_cffi Chrome 지문 위조)
+전략: Playwright 브라우저 인터셉트 → curl_cffi API 재현
 """
 
 import re
 import json
 import time
 import random
+import subprocess
 import html as html_lib
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 try:
     from curl_cffi import requests as cf_requests
@@ -692,6 +693,279 @@ def deduplicate_reviews(reviews: list) -> list:
     return result
 
 
+# ──────────── Playwright 브라우저 인터셉트 ────────────
+
+def _ensure_playwright_browser(log=None) -> bool:
+    """Playwright Chromium 브라우저가 설치돼 있는지 확인하고 없으면 설치."""
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        if log:
+            log("ℹ️ playwright 패키지 미설치")
+        return False
+
+    import os
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+    if os.path.isdir(cache_dir) and os.listdir(cache_dir):
+        return True
+
+    if log:
+        log("⬇️ Playwright Chromium 설치 중 (최초 1회)...")
+    try:
+        result = subprocess.run(
+            ["playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode == 0:
+            if log:
+                log("✅ Playwright Chromium 설치 완료")
+            return True
+        if log:
+            log(f"⚠️ playwright install 실패: {result.stderr[:100]}")
+    except Exception as e:
+        if log:
+            log(f"⚠️ playwright install 예외: {str(e)[:80]}")
+    return False
+
+
+def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
+    """
+    Playwright으로 상품 페이지를 실제 브라우저로 열고
+    리뷰 탭 로딩 시 발생하는 API 요청을 인터셉트한다.
+
+    Returns dict:
+        api_url       - 기본 URL (쿼리 제외)
+        method        - "GET" | "POST"
+        req_headers   - 브라우저가 보낸 요청 헤더
+        req_params    - GET 쿼리 파라미터 (dict)
+        req_body      - POST 바디 (dict or None)
+        page_param    - 페이지 번호 파라미터명 (예: "page" or "pageIdx")
+        reviews       - 1페이지 리뷰 목록
+        total         - 전체 리뷰 수
+    """
+    if not _ensure_playwright_browser(log=log):
+        return None
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+
+    info: dict = {
+        "api_url": None, "method": "GET",
+        "req_headers": {}, "req_params": {}, "req_body": None,
+        "page_param": "page", "reviews": [], "total": 0,
+    }
+
+    REVIEW_KWS = ("review", "gdas", "getGdas", "getReview")
+
+    def _looks_like_review_url(url: str) -> bool:
+        low = url.lower()
+        if any(ext in low for ext in (".js", ".css", ".png", ".jpg", ".svg", ".woff")):
+            return False
+        return any(kw.lower() in low for kw in REVIEW_KWS)
+
+    def _on_request(request):
+        if info["api_url"]:
+            return
+        url = request.url
+        if not _looks_like_review_url(url):
+            return
+        # Skip JS bundle fetches
+        if url.endswith(".js"):
+            return
+        info["method"] = request.method
+        info["req_headers"] = dict(request.headers)
+        parsed = urlparse(url)
+        info["api_url"] = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if parsed.query:
+            info["req_params"] = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        if request.method == "POST":
+            try:
+                body_text = request.post_data or ""
+                if body_text.startswith("{"):
+                    info["req_body"] = json.loads(body_text)
+                else:
+                    info["req_body"] = {k: v[0] for k, v in parse_qs(body_text).items()}
+            except Exception:
+                pass
+
+    def _on_response(response):
+        if info["reviews"]:
+            return
+        if response.status != 200:
+            return
+        url = response.url
+        if not _looks_like_review_url(url):
+            return
+        if url.endswith(".js"):
+            return
+        try:
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            body = response.json()
+            reviews: list = []
+            _extract_from_json_structure(body, reviews)
+            if reviews:
+                info["reviews"] = reviews
+                if isinstance(body, dict):
+                    for k in ("totalCnt", "totalCount", "total", "totalReviewCount"):
+                        if body.get(k) is not None:
+                            try:
+                                info["total"] = int(body[k])
+                            except Exception:
+                                pass
+                            break
+        except Exception:
+            pass
+
+    product_url = (
+        f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
+        f"?goodsNo={goods_no}&tab=review"
+    )
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--disable-extensions",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=PC_UA,
+                locale="ko-KR",
+                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9"},
+            )
+            page = context.new_page()
+            page.on("request", _on_request)
+            page.on("response", _on_response)
+
+            if log:
+                log("🌐 Playwright 브라우저 실행 중...")
+
+            page.goto(product_url, wait_until="domcontentloaded", timeout=45_000)
+            # 리뷰 탭 자동 클릭 시도
+            try:
+                for sel in [
+                    "a[href*='#reviewArea']",
+                    "a[href*='tab=review']",
+                    "li:has-text('리뷰') > a",
+                    "a:has-text('리뷰'):not([href*='javascript'])",
+                    "[class*='tab']:has-text('리뷰')",
+                ]:
+                    try:
+                        elem = page.locator(sel).first
+                        if elem.is_visible(timeout=2_000):
+                            elem.click(timeout=3_000)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # 리뷰 API 응답 대기 (최대 8초)
+            for _ in range(16):
+                if info["reviews"]:
+                    break
+                page.wait_for_timeout(500)
+
+            browser.close()
+
+    except Exception as e:
+        if log:
+            log(f"⚠️ Playwright 오류: {str(e)[:100]}")
+        return None
+
+    if not info["api_url"]:
+        if log:
+            log("⚠️ Playwright: 리뷰 API 요청 인터셉트 실패")
+        return None
+
+    # 페이지 파라미터명 추론
+    combined = dict(info["req_params"])
+    if info["req_body"]:
+        combined.update(info["req_body"])
+    for candidate in ("page", "pageIdx", "pageNum", "currentPage", "pageNo"):
+        if candidate in combined:
+            info["page_param"] = candidate
+            break
+
+    if log:
+        log(f"✅ Playwright API 발견: {info['api_url']}")
+        log(f"ℹ️ 메서드: {info['method']} | 페이지 파라미터: {info['page_param']}")
+        if info["total"]:
+            log(f"📊 전체 리뷰: {info['total']}개")
+
+    return info
+
+
+def _replay_playwright_api(
+    session,
+    info: dict,
+    page: int,
+    sort_code: str,
+    log=None,
+) -> tuple[list, int]:
+    """
+    _discover_review_api_via_playwright() 결과를 이용해
+    curl_cffi 세션으로 특정 페이지를 직접 재현한다.
+    """
+    api_url = info["api_url"]
+    method = info["method"]
+    page_param = info["page_param"]
+
+    # 기본 요청 데이터 복사 후 페이지 번호 변경
+    if method == "POST" and info["req_body"]:
+        body = dict(info["req_body"])
+        body[page_param] = page
+    else:
+        body = dict(info["req_params"])
+        body[page_param] = page
+
+    # 헤더 재사용 (브라우저가 보낸 헤더)
+    headers = {
+        k: v for k, v in info["req_headers"].items()
+        if k.lower() not in ("content-length", "host", ":method", ":path",
+                             ":scheme", ":authority", "transfer-encoding")
+    }
+
+    try:
+        if method == "POST":
+            resp = session.post(api_url, json=body, headers=headers, timeout=20)
+        else:
+            resp = session.get(api_url, params=body, headers=headers, timeout=20)
+
+        if resp.status_code != 200:
+            return [], 0
+
+        data = resp.json()
+        reviews: list = []
+        _extract_from_json_structure(data, reviews)
+        total = 0
+        if isinstance(data, dict):
+            api_status = data.get("status")
+            if api_status in ("NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST"):
+                if log and page == 2:
+                    log(f"⚠️ replay API 오류: {api_status} - {data.get('message','')[:60]}")
+                return [], 0
+            for k in ("totalCnt", "totalCount", "total", "totalReviewCount"):
+                if data.get(k) is not None:
+                    try:
+                        total = int(data[k])
+                    except Exception:
+                        pass
+                    break
+        return reviews, total
+
+    except Exception as e:
+        if log and page <= 3:
+            log(f"⚠️ replay 오류: {str(e)[:60]}")
+        return [], 0
+
+
 # ──────────── 메인 크롤 ────────────
 
 def crawl_reviews(
@@ -787,44 +1061,66 @@ def crawl_reviews(
     except Exception:
         pass
 
-    # ── 2. 리뷰 API 직접 호출 ──
-    log("🔍 리뷰 API 호출 중...")
+    # ── 2. Playwright 브라우저 인터셉트 (1순위) ──
+    playwright_info: dict | None = None
+    page1_reviews: list = []
+    total_count: int = 0
+    working_endpoint: str | None = None
+
+    log("🌐 Playwright 브라우저로 리뷰 API 탐색 중...")
     progress(0.1)
+    try:
+        playwright_info = _discover_review_api_via_playwright(goods_no, log=log)
+    except Exception as e:
+        log(f"⚠️ Playwright 예외: {str(e)[:80]}")
 
-    page1_reviews, total_count, working_endpoint = _try_review_api(
-        session, goods_no, 1, sort, product_url, html_text=html_text, log=log,
-    )
-
-    if working_endpoint:
-        log(f"✅ API 엔드포인트: {working_endpoint.split('/')[-1]}")
+    if playwright_info and playwright_info.get("reviews"):
+        page1_reviews = playwright_info["reviews"]
+        total_count = playwright_info.get("total", 0)
+        working_endpoint = playwright_info["api_url"]
+        log(f"✅ Playwright API 성공: {len(page1_reviews)}개 리뷰")
     else:
-        # JS 번들에서 엔드포인트 탐색
-        log("⚠️ 기본 API 실패. JS 번들 탐색 중...")
-        progress(0.2)
-        discovered_ep = _scan_js_for_review_api(session, html_text, rsc_text=rsc_text, log=log)
-
-        if discovered_ep:
-            page1_reviews, total_count, working_endpoint = _try_review_api(
-                session, goods_no, 1, sort, product_url,
-                endpoint=discovered_ep, html_text=html_text, log=log,
-            )
-            if working_endpoint:
-                log(f"✅ JS 번들 API 성공: {working_endpoint.split('/')[-1]}")
-
-    # ── 2b. 모바일 API 폴백 ──
-    if not working_endpoint:
-        log("🔍 모바일 API 시도 중 (m.oliveyoung.co.kr)...")
-        progress(0.35)
-        try:
-            page1_reviews, total_count, working_endpoint = _try_mobile_review_api(
-                session, goods_no, 1, sort, log=log, rsc_text=rsc_text,
-            )
-        except Exception as e:
-            log(f"❌ 모바일 API 예외: {str(e)[:80]}")
-        if working_endpoint:
-            log(f"✅ 모바일 API 성공: {working_endpoint.split('/')[-1]}")
+        if playwright_info:
+            log("⚠️ Playwright: API 발견했으나 리뷰 0개")
         else:
-            log("❌ 모바일 API도 실패")
+            log("⚠️ Playwright 실패. 기존 API 시도...")
+
+        # ── 2b. PC GDAS API 직접 호출 ──
+        progress(0.2)
+        page1_reviews, total_count, working_endpoint = _try_review_api(
+            session, goods_no, 1, sort, product_url, html_text=html_text, log=log,
+        )
+
+        if working_endpoint:
+            log(f"✅ API 엔드포인트: {working_endpoint.split('/')[-1]}")
+        else:
+            # JS 번들에서 엔드포인트 탐색
+            log("⚠️ 기본 API 실패. JS 번들 탐색 중...")
+            progress(0.3)
+            discovered_ep = _scan_js_for_review_api(session, html_text, rsc_text=rsc_text, log=log)
+
+            if discovered_ep:
+                page1_reviews, total_count, working_endpoint = _try_review_api(
+                    session, goods_no, 1, sort, product_url,
+                    endpoint=discovered_ep, html_text=html_text, log=log,
+                )
+                if working_endpoint:
+                    log(f"✅ JS 번들 API 성공: {working_endpoint.split('/')[-1]}")
+
+        # ── 2c. 모바일 API 폴백 ──
+        if not working_endpoint:
+            log("🔍 모바일 API 시도 중 (m.oliveyoung.co.kr)...")
+            progress(0.4)
+            try:
+                page1_reviews, total_count, working_endpoint = _try_mobile_review_api(
+                    session, goods_no, 1, sort, log=log, rsc_text=rsc_text,
+                )
+            except Exception as e:
+                log(f"❌ 모바일 API 예외: {str(e)[:80]}")
+            if working_endpoint:
+                log(f"✅ 모바일 API 성공: {working_endpoint.split('/')[-1]}")
+            else:
+                log("❌ 모바일 API도 실패")
 
     if total_count:
         log(f"📊 전체 리뷰 수: {total_count}개")
@@ -855,9 +1151,12 @@ def crawl_reviews(
         consecutive_empty = 0
 
         is_mobile_ep = "m.oliveyoung.co.kr" in working_endpoint
+        use_playwright_replay = playwright_info is not None and playwright_info.get("api_url") == working_endpoint
 
         for page_idx in range(2, estimated_pages + 1):
-            if is_mobile_ep:
+            if use_playwright_replay and playwright_info:
+                page_reviews, _ = _replay_playwright_api(session, playwright_info, page_idx, sort)
+            elif is_mobile_ep:
                 page_reviews, _, _ = _try_mobile_review_api(
                     session, goods_no, page_idx, sort,
                 )
