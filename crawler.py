@@ -2,13 +2,16 @@
 올리브영 리뷰 크롤러 - 순수 HTTP 버전 (Playwright 없음)
 Streamlit Cloud 배포용
 
-curl_cffi로 Cloudflare 우회 + 올리브영 PC GDAS 리뷰 API 호출
+전략:
+1. 모바일 API GET (m.oliveyoung.co.kr/review/api/v2/reviews)
+2. JS 번들에서 리뷰 엔드포인트 탐색
+3. 탐색된 엔드포인트 사용
 """
 
 import re
 import time
 import random
-
+import html as html_lib
 from urllib.parse import urlparse, parse_qs
 
 # curl_cffi: Cloudflare 우회를 위한 TLS fingerprinting
@@ -21,7 +24,7 @@ except ImportError:
 
 
 # ──────────── 상수 ────────────
-GDAS_API_URL = "https://www.oliveyoung.co.kr/store/goods/getGdasSearchList.do"
+MOBILE_REVIEW_URL = "https://m.oliveyoung.co.kr/review/api/v2/reviews"
 PAGE_SIZE = 10
 MAX_PAGES = 200
 
@@ -30,43 +33,50 @@ PC_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
+MOBILE_UA = (
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Mobile Safari/537.36"
+)
 
-HEADERS = {
+PC_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Origin": "https://www.oliveyoung.co.kr",
     "Referer": "https://www.oliveyoung.co.kr/",
     "User-Agent": PC_UA,
     "X-Requested-With": "XMLHttpRequest",
 }
+MOBILE_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.oliveyoung.co.kr",
+    "Referer": "https://www.oliveyoung.co.kr/",
+    "User-Agent": MOBILE_UA,
+    "X-Requested-With": "XMLHttpRequest",
+}
 
 
 def _create_session():
-    """Cloudflare 우회 가능한 세션 생성"""
     if HAS_CURL_CFFI:
         session = cf_requests.Session(impersonate="chrome")
     else:
         session = cf_requests.Session()
-
-    session.headers.update({"User-Agent": PC_UA})
+        session.headers.update({"User-Agent": PC_UA})
     return session
 
 
 def extract_goods_no(url: str) -> str | None:
-    """상품 URL에서 goodsNo 추출"""
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     if "goodsNo" in params:
         return params["goodsNo"][0]
-
     match = re.search(r"[/=](A\d{12})", url)
     if match:
         return match.group(1)
-
     return None
 
 
-def fetch_product_info(session, goods_no: str) -> tuple[str, str | None]:
-    """상품명 + 상품 페이지 HTML에서 리뷰 API 엔드포인트 동적 탐색"""
+def fetch_product_name(session, goods_no: str) -> str:
+    """PC 상품 페이지에서 상품명 추출 + 쿠키 취득"""
     url = (
         f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
         f"?goodsNo={goods_no}"
@@ -74,100 +84,131 @@ def fetch_product_info(session, goods_no: str) -> tuple[str, str | None]:
     try:
         resp = session.get(url, timeout=15)
         if resp.status_code != 200:
-            return "", None
-
+            return ""
         html = resp.text
-
-        # 상품명 추출
-        product_name = ""
         title_match = re.search(r"<title>(.*?)</title>", html, re.DOTALL)
         if title_match:
             title_text = title_match.group(1).strip()
             for sep in [" | ", " - ", " │ "]:
                 if sep in title_text:
-                    product_name = title_text.split(sep)[0].strip()
-                    break
-
-        if not product_name:
-            name_match = re.search(
-                r'class="prd_name[^"]*"[^>]*>(.*?)</[^>]+>',
-                html, re.DOTALL
-            )
-            if name_match:
-                product_name = re.sub(r"<[^>]+>", "", name_match.group(1)).strip()
-
-        # 리뷰 API 엔드포인트 동적 탐색
-        review_endpoint = None
-        # JavaScript 내 URL 패턴 검색 (gdas / review 키워드 포함 .do URL)
-        js_url_patterns = [
-            r'["\']([/]store[/][^"\']*?(?:gdas|Gdas|review|Review)[^"\']*?\.do)["\']',
-            r'url\s*[=:]\s*["\']([^"\']*?(?:gdas|review)[^"\']*?\.do)["\']',
-            r'(?:ajax|Ajax|fetch)\s*\(\s*["\']([^"\']*?(?:gdas|review)[^"\']*?)["\']',
-        ]
-        for pattern in js_url_patterns:
-            matches = re.findall(pattern, html, re.IGNORECASE)
-            for m in matches:
-                # 리뷰 목록 조회용 URL만 필터링
-                if any(k in m.lower() for k in ['list', 'search', 'get']):
-                    review_endpoint = (
-                        m if m.startswith('http')
-                        else f"https://www.oliveyoung.co.kr{m}"
-                    )
-                    break
-            if review_endpoint:
-                break
-
-        # 탐색 실패시 알려진 모든 .do URL 로깅용으로 반환
-        if not review_endpoint:
-            all_do_urls = re.findall(r'["\']([/][^"\']*?\.do)["\']', html)
-            unique_urls = list(dict.fromkeys(all_do_urls))[:20]
-            review_endpoint = "||".join(unique_urls)  # 로그용
-
-        return product_name, review_endpoint
-
+                    return title_text.split(sep)[0].strip()
+        name_match = re.search(
+            r'class="prd_name[^"]*"[^>]*>(.*?)</[^>]+>', html, re.DOTALL
+        )
+        if name_match:
+            name = re.sub(r"<[^>]+>", "", name_match.group(1)).strip()
+            if name:
+                return name
     except Exception:
         pass
-    return "", None
+    return ""
 
 
-def parse_gdas_review(item: dict) -> dict | None:
-    """GDAS 리뷰 객체 파싱"""
+def find_review_url_in_js(session, html: str) -> str | None:
+    """상품 페이지 JS 번들 파일에서 리뷰 API URL 탐색"""
+    script_srcs = re.findall(
+        r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', html
+    )
+    for src in script_srcs[:15]:
+        # 외부 CDN / 공통 라이브러리 제외
+        if any(x in src for x in ["jquery", "bootstrap", "google", "naver", "kakao", "//cdn"]):
+            continue
+        if not src.startswith("http"):
+            src = "https://www.oliveyoung.co.kr" + src
+        try:
+            resp = session.get(src, timeout=10)
+            js = resp.text[:200_000]  # 최대 200KB만 검색
+            # 리뷰/gdas 관련 .do 또는 API URL 탐색
+            candidates = re.findall(
+                r'["\`]([^"\'`\s]{5,80}(?:gdas|review|Review|Gdas)[^"\'`\s]*)["\`]',
+                js,
+            )
+            for c in candidates:
+                if any(k in c.lower() for k in ["list", "search", "get"]):
+                    return c if c.startswith("http") else f"https://www.oliveyoung.co.kr{c}"
+        except Exception:
+            continue
+    return None
+
+
+def _try_mobile_api_get(session, goods_no: str, page: int) -> dict | None:
+    """모바일 API GET 방식 시도"""
+    param_variants = [
+        {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE},
+        {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE},
+        {"goodsNo": goods_no, "pageNo": page, "pageSize": PAGE_SIZE},
+    ]
+    for params in param_variants:
+        try:
+            resp = session.get(
+                MOBILE_REVIEW_URL, params=params, headers=MOBILE_HEADERS, timeout=15
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            reviews = data.get("data") or []
+            total = data.get("totalCnt")
+            # 리뷰가 있거나 totalCnt가 숫자면 올바른 응답
+            if reviews or (total is not None and total != "None"):
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def _extract_reviews_flexible(data: dict) -> list[dict]:
+    """JSON 응답에서 리뷰 리스트 추출 (여러 키 구조 대응)"""
+    for key in ["data", "gdasList", "reviewList", "reviews", "list", "items", "contents"]:
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            return val
+    return []
+
+
+def _parse_review(item: dict) -> dict | None:
     if not isinstance(item, dict):
         return None
-
     review = {}
 
-    # 리뷰 내용
-    for k in ["gdasContent", "reviewContent", "content", "contText"]:
+    for k in ["reviewContent", "gdasContent", "content", "contText", "reviewText", "body"]:
         if item.get(k) and str(item[k]).strip():
             review["content"] = str(item[k]).strip()
             break
 
-    # 별점
-    for k in ["gdasStar", "reviewScore", "rating", "starScore", "score"]:
+    for k in ["reviewScore", "gdasStar", "rating", "score", "starScore", "starPoint"]:
         if item.get(k) is not None:
             review["rating"] = str(item[k])
             break
 
-    # 작성자
-    for k in ["membNickName", "nickName", "nickname", "memberNickname", "userName"]:
-        if item.get(k):
-            review["author"] = str(item[k]).strip()
-            break
+    # 작성자 (profileDto 중첩 포함)
+    if isinstance(item.get("profileDto"), dict):
+        for k in ["memberNickname", "nickname", "nickName"]:
+            if item["profileDto"].get(k):
+                review["author"] = str(item["profileDto"][k]).strip()
+                break
+    if "author" not in review:
+        for k in ["membNickName", "nickName", "nickname", "memberNickname", "userName"]:
+            if item.get(k):
+                review["author"] = str(item[k]).strip()
+                break
 
-    # 작성일
-    for k in ["registDate", "createDate", "regDate", "createdDateTime", "writtenDate"]:
+    for k in ["registDate", "createDate", "regDate", "createdDateTime", "writtenDate", "createdAt"]:
         if item.get(k):
             review["date"] = str(item[k]).strip()
             break
 
-    # 구매옵션
-    for k in ["selOptNm", "optionName", "option", "optNm"]:
-        if item.get(k) and str(item[k]).strip():
-            review["option"] = str(item[k]).strip()
-            break
+    # 구매옵션 (goodsDto 중첩 포함)
+    if isinstance(item.get("goodsDto"), dict):
+        for k in ["optionName", "goodsName", "optNm"]:
+            if item["goodsDto"].get(k) and str(item["goodsDto"][k]).strip():
+                review["option"] = str(item["goodsDto"][k]).strip()
+                break
+    if "option" not in review:
+        for k in ["selOptNm", "optionName", "option", "optNm"]:
+            if item.get(k) and str(item[k]).strip():
+                review["option"] = str(item[k]).strip()
+                break
 
-    # 도움수
     for k in ["usefulPoint", "recommendCount", "helpCount", "likeCount", "likeCnt"]:
         if item.get(k) is not None:
             review["helpful"] = str(item[k])
@@ -179,7 +220,6 @@ def parse_gdas_review(item: dict) -> dict | None:
 
 
 def deduplicate_reviews(reviews):
-    """리뷰 중복 제거"""
     seen = set()
     result = []
     for r in reviews:
@@ -205,19 +245,6 @@ def crawl_reviews(
     progress_callback=None,
     log_callback=None,
 ):
-    """
-    올리브영 리뷰 크롤링 (PC GDAS API)
-
-    Args:
-        goods_no: 상품번호 (예: "A000000235192")
-        max_pages: 최대 페이지 수
-        sort_type: 정렬 타입 (date, useful, star_desc, star_asc)
-        progress_callback: 진행률 콜백 (0.0 ~ 1.0)
-        log_callback: 로그 메시지 콜백
-
-    Returns:
-        tuple: (product_name, reviews_list)
-    """
     def log(msg):
         if log_callback:
             log_callback(msg)
@@ -227,87 +254,109 @@ def crawl_reviews(
             progress_callback(min(value, 1.0))
 
     session = _create_session()
+    log(f"ℹ️ curl_cffi: {'사용 중' if HAS_CURL_CFFI else '미설치 (requests 폴백)'}")
 
-    # 1. 상품 페이지 접속 (PC 쿠키 취득 + 상품명 + 리뷰 엔드포인트 탐색)
+    # 1. PC 상품 페이지 접속 (쿠키 + 상품명)
     log("📦 상품 정보를 가져오는 중...")
-    progress(0.05)
-    product_name, found_endpoint = fetch_product_info(session, goods_no)
+    progress(0.03)
+    product_name = fetch_product_name(session, goods_no)
     if product_name:
         log(f"✅ 상품명: {product_name}")
     else:
-        log("⚠️ 상품명을 가져오지 못했습니다. (크롤링은 계속됩니다)")
+        log("⚠️ 상품명을 가져오지 못했습니다.")
 
-    # 발견된 엔드포인트 처리
-    if found_endpoint and found_endpoint.startswith("https://"):
-        review_api_url = found_endpoint
-        log(f"🔗 리뷰 API 발견: {review_api_url}")
+    # 2. 모바일 사이트 warm-up
+    try:
+        session.get(
+            f"https://m.oliveyoung.co.kr/m/goods/getGoodsDetail.do?goodsNo={goods_no}",
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+    # 3. 모바일 API GET 방식 1페이지 테스트
+    log("🔍 API 탐색 중...")
+    progress(0.08)
+    test_data = _try_mobile_api_get(session, goods_no, 1)
+
+    if test_data is not None:
+        log(f"✅ 모바일 API GET 성공: {list(test_data.keys())}")
+        use_mobile = True
     else:
-        review_api_url = GDAS_API_URL
-        if found_endpoint:
-            import html as html_lib
-            log(f"🔎 페이지 내 .do URLs: {html_lib.escape(found_endpoint[:300])}")
-        log(f"🔗 기본 엔드포인트 사용: {review_api_url}")
+        log("⚠️ 모바일 API GET 실패 → JS 번들에서 엔드포인트 탐색 중...")
+        use_mobile = False
 
-    # 2. 리뷰 수집
-    log("🔍 리뷰를 수집하는 중...")
+        # JS 번들에서 리뷰 URL 탐색
+        try:
+            pc_resp = session.get(
+                f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={goods_no}",
+                timeout=15,
+            )
+            js_review_url = find_review_url_in_js(session, pc_resp.text)
+        except Exception:
+            js_review_url = None
+
+        if js_review_url:
+            log(f"🔗 JS에서 발견: {js_review_url}")
+        else:
+            log("⚠️ 리뷰 엔드포인트를 찾지 못했습니다.")
+            progress(1.0)
+            log("🎉 수집 완료! 총 0개 리뷰")
+            return product_name, []
+
+    # 4. 리뷰 수집
+    log("📋 리뷰 수집 시작...")
     all_reviews = []
     consecutive_empty = 0
-    sort = sort_type or "date"
+    estimated_pages = max_pages
 
-    for page_idx in range(1, max_pages + 1):
-        params = {
-            "goodsNo": goods_no,
-            "pagingIndex": str(page_idx),
-            "pagingSize": str(PAGE_SIZE),
-            "sort": sort,
-        }
+    # 1페이지 데이터가 이미 있으면 처리
+    start_page = 1
+    if use_mobile and test_data is not None:
+        items = _extract_reviews_flexible(test_data)
+        total_cnt = test_data.get("totalCnt")
+        if total_cnt and str(total_cnt).isdigit():
+            estimated_pages = min(max_pages, -(-int(total_cnt) // PAGE_SIZE))
+            log(f"📊 전체 리뷰 수: {total_cnt}개 (최대 {estimated_pages}페이지)")
+        page_reviews = [r for r in (_parse_review(i) for i in items) if r]
+        for r in page_reviews:
+            key = r.get("content", "")[:50]
+            if not any(e.get("content", "")[:50] == key for e in all_reviews):
+                all_reviews.append(r)
+        log(f"📄 페이지 1: 수집 {len(page_reviews)}개 | 누적 {len(all_reviews)}개")
+        if not page_reviews:
+            log(f"🔎 1페이지 응답(디버그): {html_lib.escape(str(test_data)[:300])}")
+            consecutive_empty += 1
+        start_page = 2
 
+    for page_idx in range(start_page, max_pages + 1):
         try:
-            resp = session.get(
-                review_api_url,
-                params=params,
-                timeout=15,
-                headers=HEADERS,
-            )
-
-            if resp.status_code != 200:
-                consecutive_empty += 1
-                log(f"⚠️ 페이지 {page_idx}: HTTP {resp.status_code}")
-                if consecutive_empty >= 3:
-                    log(f"⚠️ 연속 오류로 수집 종료")
-                    break
-                continue
-
-            try:
+            if use_mobile:
+                data = _try_mobile_api_get(session, goods_no, page_idx)
+                if data is None:
+                    consecutive_empty += 1
+                    log(f"⚠️ 페이지 {page_idx}: 응답 없음")
+                    if consecutive_empty >= 3:
+                        break
+                    continue
+                items = _extract_reviews_flexible(data)
+            else:
+                # JS에서 발견한 엔드포인트 사용
+                resp = session.get(
+                    js_review_url,
+                    params={"goodsNo": goods_no, "pagingIndex": page_idx, "pagingSize": PAGE_SIZE},
+                    headers=PC_HEADERS,
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
+                        break
+                    continue
                 data = resp.json()
-            except Exception:
-                if page_idx == 1:
-                    import html as html_lib
-                    raw = resp.text[:400].replace("\n", " ").replace("\r", "")
-                    preview = html_lib.escape(raw)
-                    log(f"🔎 응답(HTML이스케이프): {preview}")
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-                continue
+                items = _extract_reviews_flexible(data)
 
-            # 1페이지 디버그
-            if page_idx == 1:
-                top_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-                log(f"🔎 API 응답 키: {top_keys}")
-
-            gdas_list = data.get("gdasList") or []
-
-            # totalCnt로 전체 리뷰 수 파악
-            if page_idx == 1:
-                total_cnt = data.get("totalCnt")
-                if total_cnt:
-                    log(f"📊 전체 리뷰 수: {total_cnt}개")
-                    estimated_pages = min(max_pages, -(-int(total_cnt) // PAGE_SIZE))
-                else:
-                    estimated_pages = max_pages
-
-            page_reviews = [r for r in (parse_gdas_review(item) for item in gdas_list) if r]
+            page_reviews = [r for r in (_parse_review(i) for i in items) if r]
 
             before = len(all_reviews)
             for r in page_reviews:
@@ -319,9 +368,7 @@ def crawl_reviews(
             if page_idx <= 5 or page_idx % 10 == 0:
                 log(
                     f"📄 페이지 {page_idx}: "
-                    f"수집 {len(page_reviews)}개 | "
-                    f"신규 {new}개 | "
-                    f"누적 {len(all_reviews)}개"
+                    f"수집 {len(page_reviews)}개 | 신규 {new}개 | 누적 {len(all_reviews)}개"
                 )
 
             progress(0.1 + 0.85 * (page_idx / estimated_pages))
@@ -334,17 +381,15 @@ def crawl_reviews(
             else:
                 consecutive_empty = 0
 
-            time.sleep(random.uniform(0.3, 0.8))
+            time.sleep(random.uniform(0.3, 0.7))
 
         except Exception as e:
             consecutive_empty += 1
             log(f"❌ 페이지 {page_idx} 오류: {str(e)[:80]}")
             if consecutive_empty >= 3:
                 break
-            continue
 
     all_reviews = deduplicate_reviews(all_reviews)
     progress(1.0)
     log(f"🎉 수집 완료! 총 {len(all_reviews)}개 리뷰")
-
     return product_name, all_reviews
