@@ -954,6 +954,26 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             if log and info.get("natural_xhrs", 0) > 1:
                 log(f"📥 자연 XHR 총 {info['natural_xhrs']}페이지 → {len(info['reviews'])}개 선수집")
 
+            # ── 스크롤로 무한 스크롤 리뷰 추가 수집 ──
+            # 스크롤이 새로운 checksum XHR을 자연스럽게 트리거 → _on_response 에서 누적
+            if info["reviews"] and len(info["reviews"]) < 2000:
+                _stale_scrolls = 0
+                _prev_scroll_count = len(info["reviews"])
+                for _scroll_i in range(120):  # 최대 120회 × 300ms = 36초
+                    if len(info["reviews"]) >= 2000:
+                        break
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(300)
+                    if len(info["reviews"]) > _prev_scroll_count:
+                        _stale_scrolls = 0
+                        _prev_scroll_count = len(info["reviews"])
+                    else:
+                        _stale_scrolls += 1
+                        if _stale_scrolls >= 10:  # 3초간 새 XHR 없으면 중단
+                            break
+                if log and len(info["reviews"]) > (info.get("natural_xhrs", 1) * 10):
+                    log(f"🖱️ 스크롤 수집 완료: {len(info['reviews'])}개")
+
             # ── 브라우저 내 JavaScript fetch로 checksum 다중 수집 ──
             # /reviews 는 CORS 차단. /checksum 은 브라우저에서 허용됨.
             # (서버가 Origin: www.oliveyoung.co.kr 허용 — Playwright XHR 캡처로 확인)
@@ -1312,96 +1332,8 @@ def crawl_reviews(
         elif playwright_info.get("req_params"):
             log(f"ℹ️ 쿼리 파라미터: {str(playwright_info['req_params'])[:200]}")
 
-        # ── /checksum 엔드포인트인 경우 전체 리뷰 엔드포인트 시도 ──
-        # checksum은 일부 리뷰만 반환하므로, 브라우저 헤더로 진짜 리뷰 목록 호출
-        if "/checksum" in working_endpoint:
-            log("🔄 checksum 감지 → 전체 리뷰 엔드포인트 시도...")
-            _base = working_endpoint.rsplit("/checksum", 1)[0]  # /review/api/v2/reviews
-            _hdr = {
-                k: v for k, v in playwright_info.get("req_headers", {}).items()
-                if k.lower() not in (":method", ":path", ":scheme", ":authority",
-                                     "content-length", "transfer-encoding")
-            }
-            _sort_map = {"date": None, "useful": "USEFUL_SCORE_DESC",
-                         "star_desc": "RATING_DESC", "star_asc": "RATING_ASC"}
-            _sort_val = _sort_map.get(sort)
-
-            # 시도할 바디 조합 (goodsNumber vs goodsNo, sortCode 등)
-            _candidates = [
-                {"goodsNumber": goods_no, "page": 1, "size": PAGE_SIZE, "reviewType": "ALL"},
-                {"goodsNumber": goods_no, "page": 1, "size": PAGE_SIZE},
-                {"goodsNo": goods_no, "page": 1, "size": PAGE_SIZE, "reviewType": "ALL"},
-            ]
-            if _sort_val:
-                _candidates.insert(0, {
-                    "goodsNumber": goods_no, "page": 1, "size": PAGE_SIZE,
-                    "reviewType": "ALL", "sortCode": _sort_val,
-                })
-
-            for _body in _candidates:
-                try:
-                    _r = session.post(_base, json=_body, headers=_hdr, timeout=15)
-                    log(f"🔎 전체리뷰[{_r.status_code}] {_base.split('/')[-1]}: "
-                        f"{html_lib.escape(_r.text[:80].replace(chr(10),' '))}")
-                    if _r.status_code == 200:
-                        _d = _r.json()
-                        _api_st = _d.get("status") if isinstance(_d, dict) else None
-                        if _api_st in ("NOT_FOUND", "BAD_REQUEST", "ERROR", "FAIL",
-                                       "METHOD_NOT_ALLOWED"):
-                            continue
-                        _revs: list = []
-                        _extract_from_json_structure(_d, _revs)
-                        if _revs:
-                            log(f"✅ 전체 리뷰 엔드포인트 성공! ({len(_revs)}개)")
-                            playwright_info["api_url"] = _base
-                            playwright_info["req_body"] = _body
-                            playwright_info["req_params"] = {}
-                            playwright_info["method"] = "POST"
-                            playwright_info["page_param"] = "page"
-                            page1_reviews = _revs
-                            working_endpoint = _base
-                            # 전체 수 재확인
-                            if isinstance(_d, dict):
-                                for _k in ("totalCnt", "totalCount", "total"):
-                                    if _d.get(_k):
-                                        try:
-                                            total_count = int(_d[_k])
-                                        except Exception:
-                                            pass
-                                        break
-                            break
-                except Exception as _e:
-                    log(f"⚠️ 전체리뷰 시도 오류: {str(_e)[:60]}")
-                    continue
-
-            # ── checksum에 size=50 시도 (더 많은 리뷰) ──
-            if "/checksum" in working_endpoint:
-                _hdr2 = {
-                    k: v for k, v in playwright_info.get("req_headers", {}).items()
-                    if k.lower() not in (":method", ":path", ":scheme", ":authority",
-                                         "content-length", "transfer-encoding")
-                }
-                _body50 = dict(playwright_info.get("req_body") or {})
-                _body50["size"] = 50
-                _body50[playwright_info.get("page_param", "page")] = playwright_info.get("page_base", 0)
-                try:
-                    _r50 = session.post(working_endpoint, json=_body50, headers=_hdr2, timeout=15)
-                    if _r50.status_code == 200:
-                        _d50 = _r50.json()
-                        _revs50: list = []
-                        _extract_from_json_structure(_d50, _revs50)
-                        if _revs50:
-                            log(f"✅ checksum size=50 작동: {len(_revs50)}개/페이지")
-                            PAGE_SIZE_OVERRIDE = 50
-                            playwright_info["req_body"] = _body50
-                            playwright_info["page_size"] = 50
-                            page1_reviews = _revs50
-                        else:
-                            log(f"ℹ️ checksum size=50: 리뷰 없음 (size=10 유지)")
-                    else:
-                        log(f"ℹ️ checksum size=50: HTTP {_r50.status_code}")
-                except Exception as _e50:
-                    log(f"ℹ️ checksum size=50 오류: {str(_e50)[:50]}")
+        # checksum 엔드포인트: /reviews 는 항상 403, size=50 은 항상 403.
+        # curl_cffi 시도를 제거해 rate limit 예산 보존 (429 방지).
     else:
         if playwright_info:
             log("⚠️ Playwright: API 발견했으나 리뷰 0개")
