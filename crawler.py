@@ -1586,6 +1586,98 @@ def crawl_reviews(
         if added_photo > 0:
             log(f"📸 photo-reviews: +{added_photo}개 추가 (누적 {len(all_reviews)}개)")
 
+    # ── 6. 별점 필터 수집 (목표 1000~2000개) ──
+    # 각 별점(1~5)별로 checksum 호출 → 기존에 없던 리뷰 추가
+    if (use_playwright_replay and playwright_info
+            and "/checksum" in working_endpoint
+            and len(all_reviews) < 2000):
+
+        _hdr_star = {
+            k: v for k, v in playwright_info.get("req_headers", {}).items()
+            if k.lower() not in (":method", ":path", ":scheme", ":authority",
+                                 "content-length", "transfer-encoding")
+        }
+        _base_b = playwright_info.get("req_body") or {}
+        _star_param = None   # 유효한 별점 파라미터명 기억
+
+        # 별점 파라미터명 후보 (첫 성공 시 기억)
+        _star_param_candidates = ["starScore", "starPoint", "gdasStar", "rating"]
+
+        for _star in range(1, 6):
+            if len(all_reviews) >= 2000:
+                break
+            before_star = len(all_reviews)
+
+            # 파라미터명 결정 (이미 알면 바로 사용, 아니면 후보 순서대로 시도)
+            params_to_try = [_star_param] if _star_param else _star_param_candidates
+
+            for _pname in params_to_try:
+                if not _pname:
+                    continue
+                _sb = dict(_base_b)
+                _sb[_pname] = _star
+                _sb[playwright_info.get("page_param", "page")] = playwright_info.get("page_base", 0)
+                try:
+                    _rs = session.post(working_endpoint, json=_sb, headers=_hdr_star, timeout=15)
+                    if _rs.status_code != 200:
+                        continue
+                    _ds = _rs.json()
+                    if isinstance(_ds, dict) and _ds.get("status") in (
+                            "NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST"):
+                        continue
+                    _test_revs: list = []
+                    _extract_from_json_structure(_ds, _test_revs)
+                    if not _test_revs:
+                        continue
+                    # 유효한 파라미터명 확정
+                    _star_param = _pname
+                    break
+                except Exception:
+                    continue
+
+            if not _star_param:
+                log("ℹ️ 별점 필터 파라미터 미지원 (스킵)")
+                break
+
+            # 유효 파라미터로 전체 페이지 수집
+            consecutive_star = 0
+            for _spi in range(0, 60):
+                if len(all_reviews) >= 2000:
+                    break
+                _sb2 = dict(_base_b)
+                _sb2[_star_param] = _star
+                _sb2[playwright_info.get("page_param", "page")] = _spi
+                if playwright_info.get("page_size"):
+                    _sb2["size"] = playwright_info["page_size"]
+                try:
+                    _rs2 = session.post(working_endpoint, json=_sb2,
+                                        headers=_hdr_star, timeout=15)
+                    if _rs2.status_code != 200:
+                        break
+                    _ds2 = _rs2.json()
+                    if isinstance(_ds2, dict) and _ds2.get("status") in (
+                            "NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST"):
+                        break
+                    _sr: list = []
+                    _extract_from_json_structure(_ds2, _sr)
+                    if not _sr:
+                        consecutive_star += 1
+                        if consecutive_star >= 2:
+                            break
+                        continue
+                    consecutive_star = 0
+                    for r in _sr:
+                        key = r.get("content", "")[:50]
+                        if not any(e.get("content", "")[:50] == key for e in all_reviews):
+                            all_reviews.append(r)
+                    time.sleep(random.uniform(0.15, 0.35))
+                except Exception:
+                    break
+
+            added_star = len(all_reviews) - before_star
+            if added_star > 0 or _star == 1:
+                log(f"⭐ {_star}점: +{added_star}개 추가 (누적 {len(all_reviews)}개)")
+
     all_reviews = deduplicate_reviews(all_reviews)
     progress(1.0)
     log(f"🎉 수집 완료! 총 {len(all_reviews)}개 리뷰")
