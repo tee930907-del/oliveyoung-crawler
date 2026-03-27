@@ -132,29 +132,34 @@ def find_review_url_in_js(session, html: str) -> str | None:
     return None
 
 
-def _try_mobile_api(session, goods_no: str, page: int) -> dict | None:
-    """모바일 API POST JSON 방식 시도 (Origin: m.oliveyoung.co.kr)"""
+def _call_mobile_api(session, goods_no: str, page: int) -> tuple[dict | None, str]:
+    """모바일 API POST JSON 시도, (응답 dict, 디버그 메시지) 반환"""
     body_variants = [
         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
         {"goodsNo": goods_no, "pageNo": page, "pageSize": PAGE_SIZE},
     ]
+    last_debug = ""
     for body in body_variants:
         try:
             resp = session.post(
                 MOBILE_REVIEW_URL, json=body, headers=MOBILE_HEADERS, timeout=15
             )
-            if resp.status_code != 200:
+            status = resp.status_code
+            if status != 200:
+                last_debug = f"HTTP {status}"
                 continue
-            data = resp.json()
-            total = data.get("totalCnt")
-            reviews = data.get("data") or []
-            # totalCnt가 숫자(null이 아님)이거나 리뷰 데이터 있으면 성공
-            if reviews or (total is not None and str(total) not in ("None", "null", "")):
-                return data
-        except Exception:
-            continue
-    return None
+            try:
+                data = resp.json()
+            except Exception:
+                raw = resp.text[:200].replace("\n", " ")
+                last_debug = f"JSON 파싱 실패: {html_lib.escape(raw)}"
+                continue
+            last_debug = f"keys={list(data.keys())} totalCnt={data.get('totalCnt')} dataLen={len(data.get('data') or [])}"
+            return data, last_debug
+        except Exception as e:
+            last_debug = str(e)[:80]
+    return None, last_debug
 
 
 def _extract_reviews_flexible(data: dict) -> list[dict]:
@@ -275,16 +280,25 @@ def crawl_reviews(
     # 모바일 Referer를 상품 페이지로 설정
     MOBILE_HEADERS["Referer"] = mobile_product_url
 
-    # 3. 모바일 API POST 방식 1페이지 테스트
+    # 3. 모바일 API 1페이지 테스트
     log("🔍 API 탐색 중...")
     progress(0.08)
-    test_data = _try_mobile_api(session, goods_no, 1)
+    test_data, debug_msg = _call_mobile_api(session, goods_no, 1)
+    log(f"🔎 모바일 API 응답: {debug_msg}")
 
+    # totalCnt가 숫자이거나 data에 항목이 있으면 성공으로 간주
+    mobile_ok = False
     if test_data is not None:
-        log(f"✅ 모바일 API 성공: {list(test_data.keys())}")
+        total = test_data.get("totalCnt")
+        reviews_in_data = test_data.get("data") or []
+        if reviews_in_data or (total is not None and str(total).lstrip("-").isdigit()):
+            mobile_ok = True
+
+    if mobile_ok:
+        log(f"✅ 모바일 API 사용")
         use_mobile = True
     else:
-        log("⚠️ 모바일 API 실패 → JS 번들에서 엔드포인트 탐색 중...")
+        log("⚠️ 모바일 API 데이터 없음 → JS 번들에서 엔드포인트 탐색 중...")
         use_mobile = False
 
         # JS 번들에서 리뷰 URL 탐색
@@ -333,7 +347,7 @@ def crawl_reviews(
     for page_idx in range(start_page, max_pages + 1):
         try:
             if use_mobile:
-                data = _try_mobile_api(session, goods_no, page_idx)
+                data, _ = _call_mobile_api(session, goods_no, page_idx)
                 if data is None:
                     consecutive_empty += 1
                     log(f"⚠️ 페이지 {page_idx}: 응답 없음")
