@@ -1081,9 +1081,26 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                     _review_frame = _fr
                     break
             _eval_ctx = _review_frame if _review_frame else page
+            # 자연 XHR 캡처 헤더에서 쿠키/가상헤더 제외 → XHR에 직접 전달 시도
+            # 금지 헤더(sec-*, accept-encoding 등)는 브라우저가 setRequestHeader 에서 무시함
+            _eval_hdrs = {
+                k: v for k, v in info.get("req_headers", {}).items()
+                if not k.startswith(":") and k.lower() not in ("cookie", "content-length")
+            }
             if log:
                 _ctx_label = f"iframe({_review_frame.url[:60]})" if _review_frame else "메인페이지(www.)"
+                # 표준이 아닌 커스텀 헤더 로그 (디버그용)
+                _std = {"accept", "accept-language", "accept-encoding", "content-type",
+                        "content-length", "referer", "origin", "user-agent", "connection",
+                        "host", "cookie", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+                        "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"}
+                _custom_hdrs = {k: v[:60] for k, v in _eval_hdrs.items()
+                                if k.lower() not in _std and not k.lower().startswith("sec-")}
                 log(f"🖼️ evaluate 컨텍스트: {_ctx_label}")
+                if _custom_hdrs:
+                    log(f"📋 커스텀 XHR 헤더: {_custom_hdrs}")
+                else:
+                    log(f"📋 XHR 헤더 키: {list(_eval_hdrs.keys())[:15]}")
                 log(f"🌐 브라우저 checksum fetch: p{_natural_start}~{_pages_per_sort} × "
                     f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개)...")
 
@@ -1097,10 +1114,8 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                     _be = min(_bs + _BATCH, _pages_per_sort)
                     _pages = list(range(_bs, _be))
                     try:
-                        # XMLHttpRequest + withCredentials: 페이지 자체 XHR 방식과 동일
-                        # fetch() CORS: 서버가 withCredentials 요청에만 Allow-Credentials:true 반환
-                        # fetch() without credentials → 서버가 CORS 헤더 미설정 → TypeError
-                        # XHR withCredentials=true → 서버가 Allow-Origin:www + Allow-Credentials:true 반환
+                        # XMLHttpRequest + withCredentials + 캡처 헤더 전달
+                        # 금지헤더(sec-*, accept-encoding 등)는 setRequestHeader 에서 무시됨
                         _results = _eval_ctx.evaluate(
                             """async (args) => {
                                 const results = await Promise.all(args.pages.map(p =>
@@ -1108,6 +1123,10 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                         const xhr = new XMLHttpRequest();
                                         xhr.open("POST", args.url, true);
                                         xhr.withCredentials = true;
+                                        // 자연 XHR 캡처 헤더 전달 (금지 헤더는 자동 무시)
+                                        for (const [k, v] of Object.entries(args.headers || {})) {
+                                            try { xhr.setRequestHeader(k, v); } catch(_) {}
+                                        }
                                         xhr.setRequestHeader("Content-Type", "application/json");
                                         xhr.onload = function() {
                                             if (this.status === 200) {
@@ -1132,7 +1151,8 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                 return results;
                             }""",
                             {"url": _CHECKSUM_URL, "goodsNo": _goods,
-                             "pages": _pages, "size": _SIZE, "sortType": _sort},
+                             "pages": _pages, "size": _SIZE, "sortType": _sort,
+                             "headers": _eval_hdrs},
                         )
                     except Exception as _fe:
                         if log:
