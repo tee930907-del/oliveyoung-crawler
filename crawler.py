@@ -938,89 +938,115 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             if log and info["total"]:
                 log(f"📊 브라우저 캡처 총 리뷰 수: {info['total']}개")
 
-            # ── 브라우저 내 JavaScript fetch로 전체 리뷰 수집 ──
-            # 서버 사이드 curl_cffi는 /reviews 에 403 차단됨.
-            # 하지만 실제 브라우저 컨텍스트(cf_clearance 쿠키 포함) 에서 호출하면 허용됨.
-            _MAIN_REVIEW_URL = "https://m.oliveyoung.co.kr/review/api/v2/reviews"
-            _BATCH = 5          # 동시 fetch 수
-            _SIZE  = 50         # 페이지 당 리뷰 수
+            # ── 브라우저 내 JavaScript fetch로 checksum 다중 수집 ──
+            # /reviews 는 CORS 차단. /checksum 은 브라우저에서 허용됨.
+            # (서버가 Origin: www.oliveyoung.co.kr 허용 — Playwright XHR 캡처로 확인)
+            # curl_cffi replay는 Playwright 쿠키를 재사용 → 서버가 page≥2부터 빈 응답.
+            # 브라우저 컨텍스트(실제 쿠키)에서 직접 호출하면 deep pagination 가능.
+            _CHECKSUM_URL = "https://m.oliveyoung.co.kr/review/api/v2/reviews/checksum"
+            _BATCH = 5
+            _SIZE = 10          # checksum 안정 크기
             _goods = goods_no
             _total = info.get("total", 0)
-            _max_pages = min((_total + _SIZE - 1) // _SIZE + 2, 200) if _total else 30
+            # 정렬당 최대 페이지 수 (목표 2000개 → 3정렬 × ~67페이지)
+            _pages_per_sort = min(70, (-(-_total // _SIZE) + 2)) if _total else 50
+            _FETCH_SORTS = ["USEFUL_SCORE_DESC", "RATING_DESC", "RATING_ASC"]
 
             if log:
-                log(f"🌐 브라우저 fetch: {_max_pages}페이지 × {_SIZE}개 수집 시작...")
+                log(f"🌐 브라우저 checksum fetch: {_pages_per_sort}페이지 × {len(_FETCH_SORTS)}정렬 수집 시작...")
 
             _all_reviews_js: list = []
+            _seen_keys: set = set()
             _fetch_failed = False
 
-            for _bs in range(0, _max_pages, _BATCH):
-                _be = min(_bs + _BATCH, _max_pages)
-                _pages = list(range(_bs, _be))
-                try:
-                    _results = page.evaluate(
-                        """async (args) => {
-                            const results = await Promise.all(args.pages.map(async p => {
-                                try {
-                                    const r = await fetch(args.url, {
-                                        method: "POST",
-                                        headers: {"Content-Type": "application/json"},
-                                        body: JSON.stringify({
-                                            goodsNumber: args.goodsNo,
-                                            page: p,
-                                            size: args.size,
-                                            reviewType: "ALL",
-                                            sortType: "NEW"
-                                        })
-                                    });
-                                    if (!r.ok) return {_httpStatus: r.status};
-                                    return await r.json();
-                                } catch(e) { return {_error: String(e)}; }
-                            }));
-                            return results;
-                        }""",
-                        {"url": _MAIN_REVIEW_URL, "goodsNo": _goods,
-                         "pages": _pages, "size": _SIZE},
-                    )
-                except Exception as _fe:
-                    if log:
-                        log(f"⚠️ 브라우저 fetch 배치 오류: {str(_fe)[:80]}")
-                    _fetch_failed = True
+            for _sort in _FETCH_SORTS:
+                if len(_all_reviews_js) >= 2000:
                     break
-
-                _empty_in_batch = 0
-                for _res in (_results or []):
-                    if not isinstance(_res, dict):
-                        _empty_in_batch += 1
-                        continue
-                    if "_httpStatus" in _res or "_error" in _res:
-                        if log and _bs == 0:
-                            log(f"⚠️ 브라우저 fetch 응답 오류: {_res}")
+                _sort_consec_empty = 0
+                for _bs in range(0, _pages_per_sort, _BATCH):
+                    if len(_all_reviews_js) >= 2000:
+                        break
+                    _be = min(_bs + _BATCH, _pages_per_sort)
+                    _pages = list(range(_bs, _be))
+                    try:
+                        _results = page.evaluate(
+                            """async (args) => {
+                                const results = await Promise.all(args.pages.map(async p => {
+                                    try {
+                                        const r = await fetch(args.url, {
+                                            method: "POST",
+                                            headers: {"Content-Type": "application/json"},
+                                            body: JSON.stringify({
+                                                goodsNumber: args.goodsNo,
+                                                page: p,
+                                                size: args.size,
+                                                reviewType: "ALL",
+                                                sortType: args.sortType,
+                                            })
+                                        });
+                                        if (!r.ok) return {_httpStatus: r.status};
+                                        return await r.json();
+                                    } catch(e) { return {_error: String(e)}; }
+                                }));
+                                return results;
+                            }""",
+                            {"url": _CHECKSUM_URL, "goodsNo": _goods,
+                             "pages": _pages, "size": _SIZE, "sortType": _sort},
+                        )
+                    except Exception as _fe:
+                        if log:
+                            log(f"⚠️ 브라우저 checksum 배치 오류 ({_sort}): {str(_fe)[:80]}")
                         _fetch_failed = True
                         break
-                    _batch_revs: list = []
-                    _extract_from_json_structure(_res, _batch_revs)
-                    if _batch_revs:
-                        _all_reviews_js.extend(_batch_revs)
+
+                    _empty_in_batch = 0
+                    for _res in (_results or []):
+                        if not isinstance(_res, dict):
+                            _empty_in_batch += 1
+                            continue
+                        if "_httpStatus" in _res or "_error" in _res:
+                            if log and _bs == 0:
+                                log(f"⚠️ 브라우저 checksum 오류 ({_sort}): {_res}")
+                            _fetch_failed = True
+                            break
+                        _api_st = _res.get("status") if isinstance(_res, dict) else None
+                        if _api_st in ("BAD_REQUEST", "ERROR", "FAIL", "NOT_FOUND"):
+                            _empty_in_batch += 1
+                            continue
+                        _batch_revs: list = []
+                        _extract_from_json_structure(_res, _batch_revs)
+                        if _batch_revs:
+                            for _rv in _batch_revs:
+                                _k = _rv.get("content", "")[:50]
+                                if _k and _k not in _seen_keys:
+                                    _seen_keys.add(_k)
+                                    _all_reviews_js.append(_rv)
+                        else:
+                            _empty_in_batch += 1
+
+                    if _fetch_failed:
+                        break
+                    if _empty_in_batch == len(_pages):
+                        _sort_consec_empty += 1
+                        if _sort_consec_empty >= 2:
+                            break
                     else:
-                        _empty_in_batch += 1
+                        _sort_consec_empty = 0
+
                 if _fetch_failed:
                     break
-                if log and (_bs % 25 == 0):
-                    log(f"📄 배치 {_bs}-{_be-1}: {len(_all_reviews_js)}개 누적")
-                # 배치 내 모든 페이지가 비어있으면 종료
-                if _empty_in_batch == len(_pages):
-                    break
+                if log:
+                    log(f"📋 브라우저 checksum {_sort}: {len(_all_reviews_js)}개 누적")
 
             if _all_reviews_js and not _fetch_failed:
                 if log:
-                    log(f"✅ 브라우저 fetch 완료: {len(_all_reviews_js)}개 리뷰")
+                    log(f"✅ 브라우저 checksum fetch 완료: {len(_all_reviews_js)}개 리뷰")
                 info["reviews"] = _all_reviews_js
-                info["api_url"] = _MAIN_REVIEW_URL
+                info["api_url"] = _CHECKSUM_URL
                 info["method"] = "POST"
                 info["req_body"] = {
                     "goodsNumber": goods_no, "page": 0, "size": _SIZE,
-                    "reviewType": "ALL", "sortType": "NEW",
+                    "reviewType": "ALL", "sortType": "USEFUL_SCORE_DESC",
                 }
                 info["page_param"] = "page"
                 info["page_base"] = 0
@@ -1028,7 +1054,7 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                 info["all_fetched"] = True
             else:
                 if log:
-                    log("⚠️ 브라우저 fetch 실패 → checksum 폴백 사용")
+                    log("⚠️ 브라우저 checksum fetch 실패 → checksum 폴백 사용")
 
             browser.close()
 
@@ -1432,9 +1458,64 @@ def crawl_reviews(
         is_mobile_ep = "m.oliveyoung.co.kr" in working_endpoint
         use_playwright_replay = playwright_info is not None and playwright_info.get("api_url") == working_endpoint
 
+        # ── Mobile checksum 전용 세션 (Playwright 없이) ──
+        # 매 페이지마다 새 세션으로 product page 방문 시 Cloudflare가 3번째 방문부터 차단.
+        # 세션 한 번만 생성 후 재사용 → deep pagination 가능.
+        _mck = None
+        if (not use_playwright_replay and working_endpoint
+                and "m.oliveyoung.co.kr" in working_endpoint
+                and "/checksum" in working_endpoint):
+            _mck_referer = (f"https://m.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
+                            f"?goodsNo={goods_no}")
+            if HAS_CURL_CFFI:
+                _mck_sess = cf_requests.Session(impersonate="chrome")
+            else:
+                _mck_sess = cf_requests.Session()
+            try:
+                _mck_sess.get(_mck_referer, headers={
+                    "User-Agent": MOBILE_UA,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "ko-KR,ko;q=0.9",
+                }, timeout=15)
+            except Exception:
+                pass
+            _mck = {
+                "session": _mck_sess,
+                "headers": {
+                    "User-Agent": MOBILE_UA,
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "ko-KR,ko;q=0.9",
+                    "Content-Type": "application/json",
+                    "Origin": "https://www.oliveyoung.co.kr",
+                    "Referer": _mck_referer,
+                },
+                "body": {
+                    "goodsNumber": goods_no,
+                    "size": PAGE_SIZE,
+                    "sortType": "USEFUL_SCORE_DESC",
+                    "reviewType": "ALL",
+                },
+            }
+            log("ℹ️ Mobile checksum 세션 재사용 설정")
+
         for page_idx in range(2, estimated_pages + 1):
             if use_playwright_replay and playwright_info:
                 page_reviews, _ = _replay_playwright_api(session, playwright_info, page_idx, sort)
+            elif _mck:
+                # 세션 재사용: product page 방문 없이 직접 checksum 호출
+                _b = dict(_mck["body"])
+                _b["page"] = page_idx - 1  # 0-indexed
+                try:
+                    _r = _mck["session"].post(working_endpoint, json=_b,
+                                              headers=_mck["headers"], timeout=15)
+                    page_reviews = []
+                    if _r.status_code == 200:
+                        _d = _r.json()
+                        if not (isinstance(_d, dict) and _d.get("status") in (
+                                "BAD_REQUEST", "ERROR", "FAIL", "NOT_FOUND")):
+                            _extract_from_json_structure(_d, page_reviews)
+                except Exception:
+                    page_reviews = []
             elif is_mobile_ep:
                 page_reviews, _, _ = _try_mobile_review_api(
                     session, goods_no, page_idx, sort,
@@ -1467,23 +1548,32 @@ def crawl_reviews(
 
             time.sleep(random.uniform(0.3, 0.7))
 
-    # ── 4. checksum 다중 정렬 수집 (CORS로 /reviews 차단 → 여러 sortType으로 커버) ──
-    # checksum 엔드포인트는 sortType당 ~385개 반환. 4가지 정렬로 최대 ~1200개 unique.
-    if (use_playwright_replay and playwright_info
-            and "/checksum" in working_endpoint
-            and len(all_reviews) < 500):   # 이미 충분하면 스킵
-
-        # 확인된 유효: USEFUL_SCORE_DESC, RATING_DESC, RATING_ASC
-        # 날짜 기반 sortType은 /checksum에서 지원 안 함 (모두 BAD_REQUEST)
+    # ── 4. checksum 다중 정렬 수집 ──
+    # Playwright replay 또는 mobile 전용 세션(_mck) 경로 모두 지원.
+    _checksum_ok = (working_endpoint and "/checksum" in working_endpoint
+                    and len(all_reviews) < 500)
+    if _checksum_ok and (use_playwright_replay and playwright_info or _mck):
         extra_sorts = ["RATING_DESC", "RATING_ASC"]
-        current_sort = (playwright_info.get("req_body") or {}).get("sortType", "")
-        extra_sorts = [s for s in extra_sorts if s != current_sort]
+        if use_playwright_replay and playwright_info:
+            _current_sort = (playwright_info.get("req_body") or {}).get("sortType", "")
+            extra_sorts = [s for s in extra_sorts if s != _current_sort]
+            _es_sess = session
+            _es_hdr_fn = lambda: {
+                k: v for k, v in playwright_info.get("req_headers", {}).items()
+                if k.lower() not in (":method", ":path", ":scheme", ":authority",
+                                     "content-length", "transfer-encoding")
+            }
+            _es_body_base = dict(playwright_info.get("req_body") or {})
+            _es_page_size = playwright_info.get("page_size")
+        else:  # _mck path
+            _es_sess = _mck["session"]
+            _es_hdr_fn = lambda: dict(_mck["headers"])
+            _es_body_base = dict(_mck["body"])
+            _es_page_size = None
 
         for extra_sort in extra_sorts:
-            _extra_info = dict(playwright_info)
-            _extra_body = dict(playwright_info.get("req_body") or {})
+            _extra_body = dict(_es_body_base)
             _extra_body["sortType"] = extra_sort
-            _extra_info["req_body"] = _extra_body
 
             log(f"🔄 추가 수집: sortType={extra_sort}...")
             before_extra = len(all_reviews)
@@ -1492,17 +1582,12 @@ def crawl_reviews(
             for page_idx in range(0, 60):  # 0-indexed, max 60 pages
                 _extra_body_page = dict(_extra_body)
                 _extra_body_page["page"] = page_idx
-                if playwright_info.get("page_size"):
-                    _extra_body_page["size"] = playwright_info["page_size"]
+                if _es_page_size:
+                    _extra_body_page["size"] = _es_page_size
 
-                _hdr_e = {
-                    k: v for k, v in playwright_info.get("req_headers", {}).items()
-                    if k.lower() not in (":method", ":path", ":scheme", ":authority",
-                                         "content-length", "transfer-encoding")
-                }
                 try:
-                    _re = session.post(working_endpoint, json=_extra_body_page,
-                                       headers=_hdr_e, timeout=15)
+                    _re = _es_sess.post(working_endpoint, json=_extra_body_page,
+                                        headers=_es_hdr_fn(), timeout=15)
                     if _re.status_code != 200:
                         if log and page_idx == 0:
                             preview = _re.text[:80].replace("\n", " ")
@@ -1524,12 +1609,10 @@ def crawl_reviews(
                             break
                         continue
                     consecutive_extra = 0
-                    new_e = 0
                     for r in _page_revs:
                         key = r.get("content", "")[:50]
                         if not any(e.get("content", "")[:50] == key for e in all_reviews):
                             all_reviews.append(r)
-                            new_e += 1
                     time.sleep(random.uniform(0.2, 0.5))
                 except Exception as _ex:
                     if log and page_idx == 0:
@@ -1588,19 +1671,26 @@ def crawl_reviews(
 
     # ── 6. 별점 필터 수집 (목표 1000~2000개) ──
     # 각 별점(1~5)별로 checksum 호출 → 기존에 없던 리뷰 추가
-    if (use_playwright_replay and playwright_info
-            and "/checksum" in working_endpoint
-            and len(all_reviews) < 2000):
+    # Playwright replay 또는 mobile 전용 세션(_mck) 경로 모두 지원.
+    _checksum_ok6 = (working_endpoint and "/checksum" in working_endpoint
+                     and len(all_reviews) < 2000)
+    if _checksum_ok6 and (use_playwright_replay and playwright_info or _mck):
+        if use_playwright_replay and playwright_info:
+            _st_sess = session
+            _st_hdr_fn = lambda: {
+                k: v for k, v in playwright_info.get("req_headers", {}).items()
+                if k.lower() not in (":method", ":path", ":scheme", ":authority",
+                                     "content-length", "transfer-encoding")
+            }
+            _st_body_base = playwright_info.get("req_body") or {}
+            _st_page_size = playwright_info.get("page_size")
+        else:  # _mck path
+            _st_sess = _mck["session"]
+            _st_hdr_fn = lambda: dict(_mck["headers"])
+            _st_body_base = dict(_mck["body"])
+            _st_page_size = None
 
-        _hdr_star = {
-            k: v for k, v in playwright_info.get("req_headers", {}).items()
-            if k.lower() not in (":method", ":path", ":scheme", ":authority",
-                                 "content-length", "transfer-encoding")
-        }
-        _base_b = playwright_info.get("req_body") or {}
-        _star_param = None   # 유효한 별점 파라미터명 기억
-
-        # 별점 파라미터명 후보 (첫 성공 시 기억)
+        _star_param = None
         _star_param_candidates = ["starScore", "starPoint", "gdasStar", "rating"]
 
         for _star in range(1, 6):
@@ -1608,17 +1698,17 @@ def crawl_reviews(
                 break
             before_star = len(all_reviews)
 
-            # 파라미터명 결정 (이미 알면 바로 사용, 아니면 후보 순서대로 시도)
             params_to_try = [_star_param] if _star_param else _star_param_candidates
 
             for _pname in params_to_try:
                 if not _pname:
                     continue
-                _sb = dict(_base_b)
+                _sb = dict(_st_body_base)
                 _sb[_pname] = _star
-                _sb[playwright_info.get("page_param", "page")] = playwright_info.get("page_base", 0)
+                _sb["page"] = 0
                 try:
-                    _rs = session.post(working_endpoint, json=_sb, headers=_hdr_star, timeout=15)
+                    _rs = _st_sess.post(working_endpoint, json=_sb,
+                                        headers=_st_hdr_fn(), timeout=15)
                     if _rs.status_code != 200:
                         continue
                     _ds = _rs.json()
@@ -1629,7 +1719,6 @@ def crawl_reviews(
                     _extract_from_json_structure(_ds, _test_revs)
                     if not _test_revs:
                         continue
-                    # 유효한 파라미터명 확정
                     _star_param = _pname
                     break
                 except Exception:
@@ -1639,19 +1728,18 @@ def crawl_reviews(
                 log("ℹ️ 별점 필터 파라미터 미지원 (스킵)")
                 break
 
-            # 유효 파라미터로 전체 페이지 수집
             consecutive_star = 0
             for _spi in range(0, 60):
                 if len(all_reviews) >= 2000:
                     break
-                _sb2 = dict(_base_b)
+                _sb2 = dict(_st_body_base)
                 _sb2[_star_param] = _star
-                _sb2[playwright_info.get("page_param", "page")] = _spi
-                if playwright_info.get("page_size"):
-                    _sb2["size"] = playwright_info["page_size"]
+                _sb2["page"] = _spi
+                if _st_page_size:
+                    _sb2["size"] = _st_page_size
                 try:
-                    _rs2 = session.post(working_endpoint, json=_sb2,
-                                        headers=_hdr_star, timeout=15)
+                    _rs2 = _st_sess.post(working_endpoint, json=_sb2,
+                                         headers=_st_hdr_fn(), timeout=15)
                     if _rs2.status_code != 200:
                         break
                     _ds2 = _rs2.json()
