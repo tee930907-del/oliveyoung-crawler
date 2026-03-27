@@ -155,6 +155,50 @@ def _extract_from_json_structure(data, reviews: list, depth: int = 0):
                 _extract_from_json_structure(data[key], reviews, depth + 1)
 
 
+def _parse_nextjs_data(html: str) -> tuple[list[dict], int]:
+    """Next.js __next_f.push / __NEXT_DATA__ 에서 리뷰 탐색"""
+    reviews = []
+    total_count = 0
+
+    # 1. Pages Router: <script id="__NEXT_DATA__">
+    nd_match = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if nd_match:
+        try:
+            data = json.loads(nd_match.group(1))
+            _extract_from_json_structure(data, reviews)
+        except Exception:
+            pass
+
+    # 2. App Router: self.__next_f.push([...])
+    for m in re.finditer(r'self\.__next_f\.push\(\[(\d+),\s*"([\s\S]*?)"\]\)', html):
+        chunk_type = m.group(1)
+        if chunk_type not in ("1", "2"):
+            continue
+        try:
+            raw = m.group(2).encode().decode("unicode_escape")
+        except Exception:
+            raw = m.group(2)
+        try:
+            data = json.loads(raw)
+            _extract_from_json_structure(data, reviews)
+            if isinstance(data, dict):
+                tc = data.get("totalCnt") or data.get("totalCount")
+                if tc and str(tc).isdigit():
+                    total_count = int(tc)
+        except Exception:
+            pass
+
+    # 3. 인라인 JSON 블록 탐색 (Next.js가 <script> 안에 초기 상태로 넣을 때)
+    for m in re.finditer(r'<script[^>]*>\s*window\.__(?:INITIAL|PRELOADED)_STATE__\s*=\s*([\s\S]{20,}?)\s*</script>', html):
+        try:
+            data = json.loads(m.group(1).rstrip(";"))
+            _extract_from_json_structure(data, reviews)
+        except Exception:
+            pass
+
+    return reviews, total_count
+
+
 def _parse_html_for_reviews(html: str) -> tuple[list[dict], str | None, int]:
     """
     HTML에서 리뷰 파싱
@@ -163,6 +207,12 @@ def _parse_html_for_reviews(html: str) -> tuple[list[dict], str | None, int]:
     reviews = []
     ajax_url = None
     total_count = 0
+
+    # ── 0. Next.js 데이터 탐색 ──
+    nj_reviews, nj_total = _parse_nextjs_data(html)
+    reviews.extend(nj_reviews)
+    if nj_total:
+        total_count = nj_total
 
     # ── 1. JSON-LD 구조화 데이터 ──
     for m in re.finditer(
@@ -342,6 +392,19 @@ def crawl_reviews(
         progress(1.0)
         return "", []
 
+    # RSC 전용 응답 시도 (Next.js App Router)
+    rsc_html = ""
+    try:
+        rsc_resp = session.get(
+            product_url,
+            headers={**BASE_HEADERS, "RSC": "1", "Next-Router-Prefetch": "1"},
+            timeout=15,
+        )
+        if rsc_resp.status_code == 200:
+            rsc_html = rsc_resp.text
+    except Exception:
+        pass
+
     # 상품명 추출
     product_name = ""
     title_m = re.search(r"<title>(.*?)</title>", html_text, re.DOTALL)
@@ -361,10 +424,13 @@ def crawl_reviews(
     else:
         log("⚠️ 상품명을 가져오지 못했습니다.")
 
-    # 2. HTML에서 리뷰 파싱
-    log("🔍 HTML에서 리뷰 데이터 탐색 중...")
+    # 2. HTML + RSC에서 리뷰 파싱
+    log("🔍 HTML/RSC에서 리뷰 데이터 탐색 중...")
     progress(0.15)
-    page1_reviews, ajax_url, total_count = _parse_html_for_reviews(html_text)
+    combined_html = html_text + rsc_html
+    page1_reviews, ajax_url, total_count = _parse_html_for_reviews(combined_html)
+    if rsc_html:
+        log(f"ℹ️ RSC 응답 수신 ({len(rsc_html)} chars)")
 
     if ajax_url:
         log(f"🔗 AJAX 엔드포인트 발견: {ajax_url}")
