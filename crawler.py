@@ -424,13 +424,48 @@ def crawl_reviews(
     else:
         log("⚠️ 상품명을 가져오지 못했습니다.")
 
-    # 2. HTML + RSC에서 리뷰 파싱
+    # 2. HTML 구조 진단
+    log(f"ℹ️ HTML 크기: {len(html_text)} chars")
+    if rsc_html:
+        log(f"ℹ️ RSC 응답: {len(rsc_html)} chars → {html_lib.escape(rsc_html[:200])}")
+
+    # /_next/data/ 엔드포인트 시도 (Pages Router)
+    nextdata_reviews = []
+    build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html_text)
+    if not build_id_m:
+        build_id_m = re.search(r'/_next/static/([A-Za-z0-9_-]{10,}?)/_buildManifest', html_text)
+    if build_id_m:
+        build_id = build_id_m.group(1)
+        log(f"🔑 Next.js buildId: {build_id}")
+        nextdata_url = (
+            f"https://www.oliveyoung.co.kr/_next/data/{build_id}"
+            f"/store/goods/getGoodsDetail.json"
+        )
+        try:
+            nd_resp = session.get(
+                nextdata_url,
+                params={"goodsNo": goods_no},
+                headers={**AJAX_HEADERS, "x-nextjs-data": "1"},
+                timeout=15,
+            )
+            log(f"ℹ️ /_next/data/ 응답: HTTP {nd_resp.status_code}")
+            if nd_resp.status_code == 200:
+                nd_data = nd_resp.json()
+                _extract_from_json_structure(nd_data, nextdata_reviews)
+                log(f"📄 /_next/data/: {len(nextdata_reviews)}개 리뷰")
+        except Exception as e:
+            log(f"⚠️ /_next/data/ 실패: {str(e)[:60]}")
+    else:
+        # HTML 앞부분 디버그 출력
+        preview = html_lib.escape(html_text[:500].replace("\n", " "))
+        log(f"🔎 HTML 앞부분: {preview}")
+
+    # HTML + RSC에서 리뷰 파싱
     log("🔍 HTML/RSC에서 리뷰 데이터 탐색 중...")
     progress(0.15)
     combined_html = html_text + rsc_html
     page1_reviews, ajax_url, total_count = _parse_html_for_reviews(combined_html)
-    if rsc_html:
-        log(f"ℹ️ RSC 응답 수신 ({len(rsc_html)} chars)")
+    page1_reviews.extend(nextdata_reviews)
 
     if ajax_url:
         log(f"🔗 AJAX 엔드포인트 발견: {ajax_url}")
