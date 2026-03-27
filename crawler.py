@@ -155,6 +155,32 @@ def _extract_from_json_structure(data, reviews: list, depth: int = 0):
                 _extract_from_json_structure(data[key], reviews, depth + 1)
 
 
+def _parse_rsc_stream(text: str) -> list[dict]:
+    """Next.js App Router RSC 스트림에서 리뷰 탐색"""
+    reviews = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        colon_idx = line.find(':')
+        if colon_idx < 0:
+            continue
+        content = line[colon_idx + 1:]
+        if not content or content[0] not in ('"', '{', '['):
+            continue
+        try:
+            # 문자열 타입인 경우 언에스케이프
+            if content.startswith('"'):
+                inner = json.loads(content)
+                if isinstance(inner, str):
+                    content = inner
+            data = json.loads(content)
+            _extract_from_json_structure(data, reviews)
+        except Exception:
+            pass
+    return reviews
+
+
 def _parse_nextjs_data(html: str) -> tuple[list[dict], int]:
     """Next.js __next_f.push / __NEXT_DATA__ 에서 리뷰 탐색"""
     reviews = []
@@ -213,6 +239,12 @@ def _parse_html_for_reviews(html: str) -> tuple[list[dict], str | None, int]:
     reviews.extend(nj_reviews)
     if nj_total:
         total_count = nj_total
+
+    # ── 0b. RSC 스트림 파싱 ──
+    rsc_stream_reviews = _parse_rsc_stream(html)
+    for r in rsc_stream_reviews:
+        if r not in reviews:
+            reviews.append(r)
 
     # ── 1. JSON-LD 구조화 데이터 ──
     for m in re.finditer(
@@ -392,13 +424,18 @@ def crawl_reviews(
         progress(1.0)
         return "", []
 
-    # RSC 전용 응답 시도 (Next.js App Router)
+    # RSC 전체 스트림 요청 (Next-Router-Prefetch 없이 → 전체 컴포넌트 데이터)
     rsc_html = ""
     try:
         rsc_resp = session.get(
             product_url,
-            headers={**BASE_HEADERS, "RSC": "1", "Next-Router-Prefetch": "1"},
-            timeout=15,
+            headers={
+                **BASE_HEADERS,
+                "RSC": "1",
+                "Accept": "text/x-component",
+                # Next-Router-Prefetch 의도적으로 제거
+            },
+            timeout=30,
         )
         if rsc_resp.status_code == 200:
             rsc_html = rsc_resp.text
@@ -427,7 +464,8 @@ def crawl_reviews(
     # 2. HTML 구조 진단
     log(f"ℹ️ HTML 크기: {len(html_text)} chars")
     if rsc_html:
-        log(f"ℹ️ RSC 응답: {len(rsc_html)} chars → {html_lib.escape(rsc_html[:200])}")
+        log(f"ℹ️ RSC full 응답: {len(rsc_html)} chars")
+        log(f"🔎 RSC 앞부분: {html_lib.escape(rsc_html[:300])}")
 
     # /_next/data/ 엔드포인트 시도 (Pages Router)
     nextdata_reviews = []
