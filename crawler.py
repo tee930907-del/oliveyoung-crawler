@@ -1502,9 +1502,16 @@ def crawl_reviews(
                     _re = session.post(working_endpoint, json=_extra_body_page,
                                        headers=_hdr_e, timeout=15)
                     if _re.status_code != 200:
+                        if log and page_idx == 0:
+                            preview = _re.text[:80].replace("\n", " ")
+                            log(f"⚠️ {extra_sort} HTTP {_re.status_code}: "
+                                f"{html_lib.escape(preview)}")
                         break
                     _de = _re.json()
                     _api_st = _de.get("status") if isinstance(_de, dict) else None
+                    if log and page_idx == 0:
+                        log(f"ℹ️ {extra_sort} p0 응답: status={_api_st}, "
+                            f"keys={list(_de.keys())[:6] if isinstance(_de, dict) else '?'}")
                     if _api_st in ("NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST"):
                         break
                     _page_revs: list = []
@@ -1522,13 +1529,14 @@ def crawl_reviews(
                             all_reviews.append(r)
                             new_e += 1
                     time.sleep(random.uniform(0.2, 0.5))
-                except Exception:
+                except Exception as _ex:
+                    if log and page_idx == 0:
+                        log(f"⚠️ {extra_sort} 예외: {str(_ex)[:60]}")
                     break
 
             added = len(all_reviews) - before_extra
             log(f"📄 {extra_sort}: +{added}개 추가 (누적 {len(all_reviews)}개)")
-            if added == 0:
-                break  # 더 이상 새 리뷰 없으면 다음 정렬도 스킵
+            # 실패해도 다른 sortType은 계속 시도 (break 제거)
 
     all_reviews = deduplicate_reviews(all_reviews)
     progress(1.0)
