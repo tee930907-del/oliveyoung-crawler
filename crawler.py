@@ -227,6 +227,26 @@ def _parse_api_response(resp) -> tuple[list[dict] | None, int]:
     return reviews, total
 
 
+def _extract_csrf(html_text: str, cookies) -> str | None:
+    """HTML/쿠키에서 Spring Security CSRF 토큰 추출"""
+    # 1. <meta name="_csrf" content="..."> 패턴
+    m = re.search(r'<meta\s+name=["\']_csrf["\']\s+content=["\']([^"\']+)["\']', html_text)
+    if m:
+        return m.group(1)
+    # 2. JS 변수: _csrf:"token" 또는 csrfToken:"token"
+    m = re.search(r'(?:_csrf|csrfToken|csrf_token)["\s:]+["\']([a-zA-Z0-9\-_]{20,})["\']', html_text)
+    if m:
+        return m.group(1)
+    # 3. 쿠키: XSRF-TOKEN
+    try:
+        for c in cookies:
+            if c.name in ("XSRF-TOKEN", "_csrf", "CSRF-TOKEN"):
+                return c.value
+    except Exception:
+        pass
+    return None
+
+
 def _try_review_api(
     session,
     goods_no: str,
@@ -234,6 +254,7 @@ def _try_review_api(
     sort_code: str,
     referer: str,
     endpoint: str | None = None,
+    html_text: str = "",
     log=None,
 ) -> tuple[list[dict], int, str | None]:
     """
@@ -242,6 +263,11 @@ def _try_review_api(
     Returns (reviews, total_count, working_endpoint)
     """
     order = _SORT_ORDER.get(sort_code, "NEW")
+
+    # CSRF 토큰 추출
+    csrf_token = _extract_csrf(html_text, getattr(session, "cookies", []))
+    if csrf_token and log and page == 1:
+        log(f"ℹ️ CSRF 토큰 발견: {csrf_token[:16]}...")
 
     ajax_headers = {
         "User-Agent": PC_UA,
@@ -252,6 +278,8 @@ def _try_review_api(
         "Referer": referer,
         "Origin": "https://www.oliveyoung.co.kr",
     }
+    if csrf_token:
+        ajax_headers["X-CSRF-TOKEN"] = csrf_token
     get_headers = {k: v for k, v in ajax_headers.items() if k != "Content-Type"}
 
     endpoints_to_try = [endpoint] if endpoint else _REVIEW_ENDPOINTS
@@ -390,6 +418,7 @@ def _try_mobile_review_api(
     page: int,
     sort_code: str,
     log=None,
+    rsc_text: str = "",
 ) -> tuple[list[dict], int, str | None]:
     """
     m.oliveyoung.co.kr 모바일 리뷰 API 시도.
@@ -418,6 +447,21 @@ def _try_mobile_review_api(
 
     # goodsNo 변형 (A + 12자리 숫자 → 숫자만, 또는 그대로)
     goods_no_num = goods_no[1:] if goods_no.startswith("A") else goods_no
+
+    # RSC 스트림에서 다른 goodsNo 형식 탐색 (예: 소문자 a, 다른 접두어 등)
+    rsc_ids: list[str] = []
+    if rsc_text:
+        # RSC 데이터에서 goodsNo 패턴 탐색
+        for pat in [
+            r'"goodsNo"\s*:\s*"([^"]{6,20})"',
+            r'"goodsCd"\s*:\s*"([^"]{6,20})"',
+            r'"itemNo"\s*:\s*"([^"]{6,20})"',
+        ]:
+            for m in re.findall(pat, rsc_text):
+                if m not in rsc_ids and m != goods_no:
+                    rsc_ids.append(m)
+        if rsc_ids and log and page == 1:
+            log(f"ℹ️ RSC 내 상품ID 변형: {rsc_ids[:5]}")
 
     # (endpoint, method, origin, body) — origin=None이면 헤더 미포함
     attempts = [
@@ -456,6 +500,14 @@ def _try_mobile_review_api(
          "https://m.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
     ]
+
+    # RSC에서 찾은 대체 goodsNo로 v1 추가 시도
+    for alt_id in rsc_ids[:3]:
+        attempts.append((
+            "https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
+            "https://m.oliveyoung.co.kr",
+            {"goodsNo": alt_id, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order},
+        ))
 
     for api_url, method, origin, body in attempts:
         h = {
@@ -614,7 +666,7 @@ def crawl_reviews(
     progress(0.1)
 
     page1_reviews, total_count, working_endpoint = _try_review_api(
-        session, goods_no, 1, sort, product_url, log=log,
+        session, goods_no, 1, sort, product_url, html_text=html_text, log=log,
     )
 
     if working_endpoint:
@@ -628,7 +680,7 @@ def crawl_reviews(
         if discovered_ep:
             page1_reviews, total_count, working_endpoint = _try_review_api(
                 session, goods_no, 1, sort, product_url,
-                endpoint=discovered_ep, log=log,
+                endpoint=discovered_ep, html_text=html_text, log=log,
             )
             if working_endpoint:
                 log(f"✅ JS 번들 API 성공: {working_endpoint.split('/')[-1]}")
@@ -639,7 +691,7 @@ def crawl_reviews(
         progress(0.35)
         try:
             page1_reviews, total_count, working_endpoint = _try_mobile_review_api(
-                session, goods_no, 1, sort, log=log,
+                session, goods_no, 1, sort, log=log, rsc_text=rsc_text,
             )
         except Exception as e:
             log(f"❌ 모바일 API 예외: {str(e)[:80]}")
