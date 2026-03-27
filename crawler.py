@@ -943,18 +943,24 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             log("⚠️ Playwright: 리뷰 API 요청 인터셉트 실패")
         return None
 
-    # 페이지 파라미터명 추론
+    # 페이지 파라미터명 + 기준값(0-indexed vs 1-indexed) 추론
     combined = dict(info["req_params"])
     if info["req_body"]:
         combined.update(info["req_body"])
     for candidate in ("page", "pageIdx", "pageNum", "currentPage", "pageNo"):
         if candidate in combined:
             info["page_param"] = candidate
+            try:
+                info["page_base"] = int(combined[candidate])   # 0 or 1
+            except Exception:
+                info["page_base"] = 1
             break
 
     if log:
         log(f"✅ Playwright API 발견: {info['api_url']}")
-        log(f"ℹ️ 메서드: {info['method']} | 페이지 파라미터: {info['page_param']}")
+        base = info.get("page_base", 1)
+        log(f"ℹ️ 메서드: {info['method']} | 페이지 파라미터: {info['page_param']} "
+            f"(기준={base}, {'0-indexed' if base == 0 else '1-indexed'})")
         if info["total"]:
             log(f"📊 전체 리뷰: {info['total']}개")
 
@@ -975,14 +981,20 @@ def _replay_playwright_api(
     api_url = info["api_url"]
     method = info["method"]
     page_param = info["page_param"]
+    # page_base: 브라우저가 첫 페이지에 사용한 값 (0 또는 1)
+    # page 인자는 항상 1-indexed (2, 3, 4...) 이므로 API에 맞게 변환
+    page_base = info.get("page_base", 1)
+    api_page = (page - 1) + page_base   # 1-indexed→0-indexed: page=2→api_page=1
 
     # 기본 요청 데이터 복사 후 페이지 번호 변경
     if method == "POST" and info["req_body"]:
         body = dict(info["req_body"])
-        body[page_param] = page
     else:
         body = dict(info["req_params"])
-        body[page_param] = page
+    body[page_param] = api_page
+    # page_size override (size=50 등)
+    if info.get("page_size"):
+        body["size"] = info["page_size"]
 
     # 헤더 재사용 (브라우저가 보낸 헤더)
     headers = {
@@ -1206,6 +1218,35 @@ def crawl_reviews(
                 except Exception as _e:
                     log(f"⚠️ 전체리뷰 시도 오류: {str(_e)[:60]}")
                     continue
+
+            # ── checksum에 size=50 시도 (더 많은 리뷰) ──
+            if "/checksum" in working_endpoint:
+                _hdr2 = {
+                    k: v for k, v in playwright_info.get("req_headers", {}).items()
+                    if k.lower() not in (":method", ":path", ":scheme", ":authority",
+                                         "content-length", "transfer-encoding")
+                }
+                _body50 = dict(playwright_info.get("req_body") or {})
+                _body50["size"] = 50
+                _body50[playwright_info.get("page_param", "page")] = playwright_info.get("page_base", 0)
+                try:
+                    _r50 = session.post(working_endpoint, json=_body50, headers=_hdr2, timeout=15)
+                    if _r50.status_code == 200:
+                        _d50 = _r50.json()
+                        _revs50: list = []
+                        _extract_from_json_structure(_d50, _revs50)
+                        if _revs50:
+                            log(f"✅ checksum size=50 작동: {len(_revs50)}개/페이지")
+                            PAGE_SIZE_OVERRIDE = 50
+                            playwright_info["req_body"] = _body50
+                            playwright_info["page_size"] = 50
+                            page1_reviews = _revs50
+                        else:
+                            log(f"ℹ️ checksum size=50: 리뷰 없음 (size=10 유지)")
+                    else:
+                        log(f"ℹ️ checksum size=50: HTTP {_r50.status_code}")
+                except Exception as _e50:
+                    log(f"ℹ️ checksum size=50 오류: {str(_e50)[:50]}")
     else:
         if playwright_info:
             log("⚠️ Playwright: API 발견했으나 리뷰 0개")
