@@ -346,6 +346,26 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
     for m in re.findall(r'"(/_next/static/[^"]+?\.js)"', html_text):
         bundle_urls.append(f"https://www.oliveyoung.co.kr{m}")
 
+    # ★ Next.js buildManifest에서 페이지별 동적 청크 추가
+    build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html_text)
+    if not build_id_m:
+        build_id_m = re.search(r'/_next/static/([a-zA-Z0-9_-]{10,40})/', html_text)
+    if build_id_m:
+        build_id = build_id_m.group(1)
+        manifest_url = f"https://www.oliveyoung.co.kr/_next/static/{build_id}/_buildManifest.js"
+        try:
+            mresp = session.get(manifest_url, headers={"User-Agent": PC_UA}, timeout=10)
+            if mresp.status_code == 200:
+                # buildManifest에서 모든 청크 URL 추출
+                for chunk in re.findall(r'"(/_next/static/chunks/[^"]+\.js)"', mresp.text):
+                    full = f"https://www.oliveyoung.co.kr{chunk}"
+                    if full not in bundle_urls:
+                        bundle_urls.append(full)
+                if log:
+                    log(f"ℹ️ buildManifest 청크 추가 ({build_id[:8]}...): 총 {len(bundle_urls)}개")
+        except Exception:
+            pass
+
     # 중복 제거
     seen: set = set()
     unique: list = []
@@ -395,6 +415,7 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
             # 번들에서 review/gdas 관련 문자열 찾아 디버그 출력
             if log:
                 fname = url.split('/')[-1][:25]
+                found_kw = False
                 for kw in ['review', 'gdas', 'Review', 'GDAS']:
                     idx = bundle_text.find(f'"{kw}')
                     if idx < 0:
@@ -402,7 +423,11 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
                     if idx >= 0:
                         ctx = bundle_text[max(0, idx - 20):idx + 80].replace('\n', ' ')
                         log(f"📦 [{fname}] {html_lib.escape(ctx[:90])}")
+                        found_kw = True
                         break
+                # 번들이 실제 JS인지 확인 (첫 번째 번들만)
+                if not found_kw and ordered.index(url) == 0:
+                    log(f"📦 첫번들[{len(bundle_text)}chars]: {html_lib.escape(bundle_text[:60])}")
         except Exception as e:
             if log:
                 log(f"⚠️ 번들 오류: {str(e)[:50]}")
