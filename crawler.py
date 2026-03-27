@@ -593,9 +593,16 @@ def _try_mobile_review_api(
          "https://www.oliveyoung.co.kr",
          {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, _token_h),
         # ★ v2 path (토큰 없이, 기존과 같음)
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+        # ★ checksum 엔드포인트 직접 시도 (Playwright 없이)
+        # — Playwright가 캡처한 정확한 파라미터 형식 사용 (page=0-indexed, sortType)
+        ("https://m.oliveyoung.co.kr/review/api/v2/reviews/checksum", "POST",
          "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
+         {"goodsNumber": goods_no, "page": page - 1, "size": PAGE_SIZE,
+          "sortType": "USEFUL_SCORE_DESC", "reviewType": "ALL"}, None),
+        ("https://m.oliveyoung.co.kr/review/api/v2/reviews/checksum", "POST",
+         "https://www.oliveyoung.co.kr",
+         {"goodsNumber": goods_no, "page": page - 1, "size": PAGE_SIZE,
+          "sortType": "NEW", "reviewType": "ALL"}, None),
         # ★ v2 POST (Cloudflare 통과 시도)
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          "https://www.oliveyoung.co.kr",
@@ -1232,10 +1239,16 @@ def crawl_reviews(
 
     log("🌐 Playwright 브라우저로 리뷰 API 탐색 중...")
     progress(0.1)
-    try:
-        playwright_info = _discover_review_api_via_playwright(goods_no, log=log)
-    except Exception as e:
-        log(f"⚠️ Playwright 예외: {str(e)[:80]}")
+    for _pw_attempt in range(2):  # 최대 2회 시도
+        try:
+            playwright_info = _discover_review_api_via_playwright(goods_no, log=log)
+        except Exception as e:
+            log(f"⚠️ Playwright 예외: {str(e)[:80]}")
+            playwright_info = None
+        if playwright_info and playwright_info.get("reviews"):
+            break
+        if _pw_attempt == 0 and not (playwright_info and playwright_info.get("reviews")):
+            log("⚠️ Playwright 1차 실패. 3초 후 재시도...")
 
     if playwright_info and playwright_info.get("reviews"):
         page1_reviews = playwright_info["reviews"]
