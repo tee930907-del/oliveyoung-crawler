@@ -433,21 +433,39 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
                         return full_url
 
             # 번들에서 review/gdas 관련 문자열 찾아 디버그 출력
-            if log:
-                fname = url.split('/')[-1][:25]
-                found_kw = False
-                for kw in ['review', 'gdas', 'Review', 'GDAS']:
-                    idx = bundle_text.find(f'"{kw}')
-                    if idx < 0:
-                        idx = bundle_text.find(f'/{kw}')
-                    if idx >= 0:
+            fname = url.split('/')[-1][:30]
+            found_kw = False
+            for kw in ['review', 'gdas', 'Review', 'GDAS']:
+                idx = bundle_text.find(f'"{kw}')
+                if idx < 0:
+                    idx = bundle_text.find(f'/{kw}')
+                if idx >= 0:
+                    found_kw = True
+                    if log:
                         ctx = bundle_text[max(0, idx - 20):idx + 80].replace('\n', ' ')
                         log(f"📦 [{fname}] {html_lib.escape(ctx[:90])}")
-                        found_kw = True
-                        break
-                # 번들이 실제 JS인지 확인 (첫 번째 번들만)
-                if not found_kw and ordered.index(url) == 0:
-                    log(f"📦 첫번들[{len(bundle_text)}chars]: {html_lib.escape(bundle_text[:60])}")
+
+                    # ★ 이 번들이 리뷰 코드 포함 → 더 깊이 탐색
+                    for search_term in ['goodsNumber', 'reviewType', 'review/api', 'goodsNo']:
+                        si = bundle_text.find(search_term)
+                        if si >= 0:
+                            ctx2 = bundle_text[max(0, si - 60):si + 120].replace('\n', ' ')
+                            if log:
+                                log(f"🔍 [{fname}|{search_term}]: {html_lib.escape(ctx2[:150])}")
+
+                    # fetch/axios URL 패턴 전체 재탐색 (더 넓은 패턴)
+                    extra_patterns = [
+                        re.compile(r'["\`]((?:https?:)?//[^\s"\'`]{5,100}(?:review|gdas)[^\s"\'`]{0,50})["\`]', re.I),
+                        re.compile(r'["\`](/[a-z0-9/_-]{3,80}(?:review|gdas)[a-z0-9/_-]{0,50})["\`]', re.I),
+                    ]
+                    for ep in extra_patterns:
+                        for m in ep.findall(bundle_text):
+                            if log:
+                                log(f"🔑 번들 URL 후보: {html_lib.escape(m[:100])}")
+                    break
+
+            if log and not found_kw and ordered.index(url) == 0:
+                log(f"📦 첫번들[{len(bundle_text)}chars]: {html_lib.escape(bundle_text[:60])}")
         except Exception as e:
             if log:
                 log(f"⚠️ 번들 오류: {str(e)[:50]}")
