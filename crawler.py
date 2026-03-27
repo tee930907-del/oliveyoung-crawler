@@ -1,10 +1,6 @@
 """
-올리브영 리뷰 크롤러 - 순수 HTTP 버전 (Playwright 없음)
-Streamlit Cloud 배포용
-
-전략:
-1. 상품 페이지 HTML 파싱 (JSON-LD / 인라인 JS / HTML 구조)
-2. 페이지 내 AJAX 엔드포인트 발견 시 추가 페이지 수집
+올리브영 리뷰 크롤러 - Streamlit Cloud 배포용
+전략: PC GDAS API 직접 호출 (curl_cffi Chrome 지문 위조)
 """
 
 import re
@@ -30,18 +26,6 @@ PC_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
-BASE_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-    "User-Agent": PC_UA,
-}
-AJAX_HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://www.oliveyoung.co.kr",
-    "Referer": "https://www.oliveyoung.co.kr/",
-    "User-Agent": PC_UA,
-    "X-Requested-With": "XMLHttpRequest",
-}
 
 SORT_MAP = {
     "최신순": "date",
@@ -49,6 +33,23 @@ SORT_MAP = {
     "별점높은순": "star_desc",
     "별점낮은순": "star_asc",
 }
+
+# 정렬 코드 → GDAS order 파라미터
+_SORT_ORDER = {
+    "date": "NEW",
+    "useful": "RECOMMEND",
+    "star_desc": "HIGH",
+    "star_asc": "LOW",
+}
+
+# 시도할 리뷰 API 엔드포인트 목록 (POST/GET 모두 시도)
+_REVIEW_ENDPOINTS = [
+    "https://www.oliveyoung.co.kr/store/goods/getGdasReviewList.do",
+    "https://www.oliveyoung.co.kr/store/goods/getGoodsGdasList.do",
+    "https://www.oliveyoung.co.kr/store/review/getReviewList.do",
+    "https://www.oliveyoung.co.kr/store/goods/getGdasSearchList.do",
+    "https://www.oliveyoung.co.kr/store/goods/getGoodsCriteriaReviewList.do",
+]
 
 
 def _create_session():
@@ -71,23 +72,50 @@ def extract_goods_no(url: str) -> str | None:
     return None
 
 
+# ──────────── 리뷰 dict 파싱 ────────────
+
+_HTML_META_PATTERN = re.compile(
+    r'width=device|initial-scale|viewport-fit|charset|user-scalable'
+    r'|text/javascript|text/css|IE=edge',
+    re.IGNORECASE,
+)
+
+
 def _parse_review_dict(item: dict) -> dict | None:
     if not isinstance(item, dict):
         return None
     review = {}
 
-    for k in ["reviewContent", "gdasContent", "content", "contText", "reviewText",
-              "reviewBody", "body", "text"]:
+    # 구체적인 리뷰 필드 우선 (오탐 없음)
+    specific_keys = ["reviewContent", "gdasContent", "reviewText", "reviewBody", "contText"]
+    generic_keys = ["content", "body", "text"]
+
+    for k in specific_keys:
         if item.get(k) and str(item[k]).strip():
             review["content"] = str(item[k]).strip()
             break
+
+    if "content" not in review:
+        for k in generic_keys:
+            val = str(item.get(k) or "").strip()
+            if not val or len(val) < 6:
+                continue
+            if _HTML_META_PATTERN.search(val):
+                continue
+            has_korean = bool(re.search(r'[가-힣]', val))
+            has_review_field = any(item.get(f) for f in [
+                "reviewScore", "gdasStar", "rating", "score", "starScore",
+                "membNickName", "nickName", "nickname", "registDate", "createDate",
+            ])
+            if has_korean or has_review_field:
+                review["content"] = val
+                break
 
     for k in ["reviewScore", "gdasStar", "rating", "score", "starScore", "starPoint",
               "ratingValue"]:
         if item.get(k) is not None:
             review["rating"] = str(item[k])
             break
-    # JSON-LD reviewRating 중첩
     if "rating" not in review and isinstance(item.get("reviewRating"), dict):
         rv = item["reviewRating"].get("ratingValue")
         if rv is not None:
@@ -155,232 +183,166 @@ def _extract_from_json_structure(data, reviews: list, depth: int = 0):
                 _extract_from_json_structure(data[key], reviews, depth + 1)
 
 
-def _parse_rsc_stream(text: str) -> list[dict]:
-    """Next.js App Router RSC 스트림에서 리뷰 탐색"""
-    reviews = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        colon_idx = line.find(':')
-        if colon_idx < 0:
-            continue
-        content = line[colon_idx + 1:]
-        if not content or content[0] not in ('"', '{', '['):
-            continue
-        try:
-            # 문자열 타입인 경우 언에스케이프
-            if content.startswith('"'):
-                inner = json.loads(content)
-                if isinstance(inner, str):
-                    content = inner
-            data = json.loads(content)
-            _extract_from_json_structure(data, reviews)
-        except Exception:
-            pass
-    return reviews
+# ──────────── API 호출 ────────────
 
-
-def _parse_nextjs_data(html: str) -> tuple[list[dict], int]:
-    """Next.js __next_f.push / __NEXT_DATA__ 에서 리뷰 탐색"""
-    reviews = []
-    total_count = 0
-
-    # 1. Pages Router: <script id="__NEXT_DATA__">
-    nd_match = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if nd_match:
-        try:
-            data = json.loads(nd_match.group(1))
-            _extract_from_json_structure(data, reviews)
-        except Exception:
-            pass
-
-    # 2. App Router: self.__next_f.push([...])
-    for m in re.finditer(r'self\.__next_f\.push\(\[(\d+),\s*"([\s\S]*?)"\]\)', html):
-        chunk_type = m.group(1)
-        if chunk_type not in ("1", "2"):
-            continue
-        try:
-            raw = m.group(2).encode().decode("unicode_escape")
-        except Exception:
-            raw = m.group(2)
-        try:
-            data = json.loads(raw)
-            _extract_from_json_structure(data, reviews)
-            if isinstance(data, dict):
-                tc = data.get("totalCnt") or data.get("totalCount")
-                if tc and str(tc).isdigit():
-                    total_count = int(tc)
-        except Exception:
-            pass
-
-    # 3. 인라인 JSON 블록 탐색 (Next.js가 <script> 안에 초기 상태로 넣을 때)
-    for m in re.finditer(r'<script[^>]*>\s*window\.__(?:INITIAL|PRELOADED)_STATE__\s*=\s*([\s\S]{20,}?)\s*</script>', html):
-        try:
-            data = json.loads(m.group(1).rstrip(";"))
-            _extract_from_json_structure(data, reviews)
-        except Exception:
-            pass
-
-    return reviews, total_count
-
-
-def _parse_html_for_reviews(html: str) -> tuple[list[dict], str | None, int]:
+def _parse_api_response(resp) -> tuple[list[dict] | None, int]:
     """
-    HTML에서 리뷰 파싱
-    Returns: (reviews, ajax_url, total_count)
+    API 응답 파싱.
+    Returns (reviews, total_count).  reviews=None → 유효한 JSON 응답 아님.
     """
+    if resp.status_code != 200:
+        return None, 0
+    text = resp.text
+    if not text or len(text) < 10:
+        return None, 0
+    # HTML 응답 감지
+    if text.lstrip().startswith('<'):
+        return None, 0
+    try:
+        data = resp.json()
+    except Exception:
+        return None, 0
+
     reviews = []
-    ajax_url = None
-    total_count = 0
+    _extract_from_json_structure(data, reviews)
 
-    # ── 0. Next.js 데이터 탐색 ──
-    nj_reviews, nj_total = _parse_nextjs_data(html)
-    reviews.extend(nj_reviews)
-    if nj_total:
-        total_count = nj_total
-
-    # ── 0b. RSC 스트림 파싱 ──
-    rsc_stream_reviews = _parse_rsc_stream(html)
-    for r in rsc_stream_reviews:
-        if r not in reviews:
-            reviews.append(r)
-
-    # ── 1. JSON-LD 구조화 데이터 ──
-    for m in re.finditer(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL
-    ):
-        try:
-            data = json.loads(m.group(1))
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                _extract_from_json_structure(item, reviews)
-        except Exception:
-            pass
-
-    # ── 2. 인라인 JS 변수 탐색 ──
-    if not reviews:
-        js_var_patterns = [
-            r'(?:var\s+|let\s+|const\s+)?(?:reviewList|gdasList|reviewData|reviews)\s*[=:]\s*(\[[\s\S]{10,5000}?\])\s*[,;}\n]',
-            r'"(?:reviewList|gdasList|reviews)"\s*:\s*(\[[\s\S]{10,5000}?\])',
-        ]
-        for pattern in js_var_patterns:
-            match = re.search(pattern, html)
-            if match:
+    total = 0
+    if isinstance(data, dict):
+        for k in ["totalCnt", "totalCount", "total", "count", "totalReviewCount"]:
+            v = data.get(k)
+            if v is not None:
                 try:
-                    items = json.loads(match.group(1))
-                    if isinstance(items, list):
-                        for item in items:
-                            r = _parse_review_dict(item)
-                            if r:
-                                reviews.append(r)
-                        if reviews:
-                            break
+                    total = int(v)
+                    break
                 except Exception:
                     pass
 
-    # ── 3. HTML review 요소 탐색 ──
-    if not reviews:
-        # 별점 + 리뷰 텍스트 패턴으로 추출
-        review_blocks = re.findall(
-            r'(?:class="(?:review_cont|review_item|gdas_item|review-item)[^"]*"[^>]*>)'
-            r'([\s\S]{50,2000}?)'
-            r'(?=class="(?:review_cont|review_item|gdas_item|review-item)|</ul>|</div>\s*</div>)',
-            html
-        )
-        for block in review_blocks[:50]:
-            review = {}
-            # 별점
-            star_m = re.search(r'(?:data-score|data-star|star_rating)[^"]*"(\d+)"', block)
-            if not star_m:
-                star_m = re.search(r'(?:class="star[_-]?\w*")[^>]*>\s*(\d+)', block)
-            if star_m:
-                review["rating"] = star_m.group(1)
-
-            # 리뷰 내용 (태그 제거)
-            text_m = re.search(
-                r'class="(?:review_cont_text|review_text|gdas_cont|cont|review-text)[^"]*"[^>]*>([\s\S]{5,}?)</(?:p|div|span)>',
-                block
-            )
-            if text_m:
-                review["content"] = re.sub(r'<[^>]+>', '', text_m.group(1)).strip()
-
-            if review.get("content") and len(review["content"]) > 5:
-                reviews.append(review)
-
-    # ── 4. 전체 리뷰 수 탐색 ──
-    total_patterns = [
-        r'"totalCnt"\s*:\s*(\d+)',
-        r'"totalCount"\s*:\s*(\d+)',
-        r'id="reviewCount"[^>]*>\s*([\d,]+)',
-        r'class="(?:review_count|review-count|total_count)[^"]*"[^>]*>([\d,]+)',
-        r'총\s*([\d,]+)\s*개',
-    ]
-    for pattern in total_patterns:
-        m = re.search(pattern, html)
-        if m:
-            try:
-                total_count = int(m.group(1).replace(",", ""))
-                break
-            except Exception:
-                pass
-
-    # ── 5. AJAX 엔드포인트 탐색 (인라인 JS) ──
-    ajax_patterns = [
-        r'["\`]([/][^"\'`\s]{5,80}?(?:gdas|review|Gdas|Review)[^"\'`\s]*?\.do)["\`]',
-        r'url\s*[=:]\s*["\']([^"\']{10,80}?(?:gdas|review)[^"\']*?)["\']',
-    ]
-    for pattern in ajax_patterns:
-        matches = re.findall(pattern, html, re.IGNORECASE)
-        for candidate in matches:
-            if any(k in candidate.lower() for k in ["list", "search", "get"]):
-                ajax_url = (
-                    candidate if candidate.startswith("http")
-                    else f"https://www.oliveyoung.co.kr{candidate}"
-                )
-                break
-        if ajax_url:
-            break
-
-    return reviews, ajax_url, total_count
+    return reviews, total
 
 
-def _fetch_ajax_page(session, ajax_url: str, goods_no: str, page: int, sort: str) -> list[dict]:
-    """발견된 AJAX URL로 추가 페이지 수집"""
-    param_variants = [
-        {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE, "sort": sort},
-        {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "sort": sort},
+def _try_review_api(
+    session,
+    goods_no: str,
+    page: int,
+    sort_code: str,
+    referer: str,
+    endpoint: str | None = None,
+    log=None,
+) -> tuple[list[dict], int, str | None]:
+    """
+    리뷰 API 호출.
+    endpoint 지정 시 해당 URL만 시도, 없으면 _REVIEW_ENDPOINTS 전체 시도.
+    Returns (reviews, total_count, working_endpoint)
+    """
+    order = _SORT_ORDER.get(sort_code, "NEW")
+
+    ajax_headers = {
+        "User-Agent": PC_UA,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": referer,
+        "Origin": "https://www.oliveyoung.co.kr",
+    }
+    get_headers = {k: v for k, v in ajax_headers.items() if k != "Content-Type"}
+
+    endpoints_to_try = [endpoint] if endpoint else _REVIEW_ENDPOINTS
+
+    param_sets = [
+        {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE, "order": order},
+        {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE, "sortType": order},
         {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE},
+        {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "order": order},
     ]
-    for params in param_variants:
-        try:
-            resp = session.get(ajax_url, params=params, headers=AJAX_HEADERS, timeout=15)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            reviews = []
-            _extract_from_json_structure(data, reviews)
-            if reviews:
-                return reviews
-        except Exception:
-            pass
-        try:
-            resp = session.post(ajax_url, data=params, headers=AJAX_HEADERS, timeout=15)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            reviews = []
-            _extract_from_json_structure(data, reviews)
-            if reviews:
-                return reviews
-        except Exception:
-            pass
-    return []
+
+    for ep in endpoints_to_try:
+        for params in param_sets:
+            # POST 시도
+            try:
+                resp = session.post(ep, data=params, headers=ajax_headers, timeout=15)
+                reviews, total = _parse_api_response(resp)
+                if reviews is not None:
+                    return reviews, total, ep
+                if log and page == 1:
+                    preview = resp.text[:120].replace("\n", " ")
+                    log(f"🔎 POST {ep.split('/')[-1]} → HTTP {resp.status_code} | {html_lib.escape(preview)}")
+            except Exception as e:
+                if log and page == 1:
+                    log(f"⚠️ POST {ep.split('/')[-1]} 예외: {str(e)[:60]}")
+
+            # GET 시도
+            try:
+                resp = session.get(ep, params=params, headers=get_headers, timeout=15)
+                reviews, total = _parse_api_response(resp)
+                if reviews is not None:
+                    return reviews, total, ep
+                if log and page == 1:
+                    preview = resp.text[:120].replace("\n", " ")
+                    log(f"🔎 GET {ep.split('/')[-1]} → HTTP {resp.status_code} | {html_lib.escape(preview)}")
+            except Exception as e:
+                if log and page == 1:
+                    log(f"⚠️ GET {ep.split('/')[-1]} 예외: {str(e)[:60]}")
+
+    return [], 0, None
 
 
-def deduplicate_reviews(reviews):
-    seen = set()
+def _scan_js_for_review_api(session, html_text: str, log=None) -> str | None:
+    """JS 번들 파일에서 리뷰 API 엔드포인트 패턴 탐색"""
+    bundle_urls = []
+
+    # CDN 번들
+    cdn_matches = re.findall(
+        r'https://cf-static\.oliveyoung\.co\.kr/[^\s"\'<>]+?\.js',
+        html_text,
+    )
+    bundle_urls.extend(cdn_matches)
+
+    # 상대 경로 번들
+    for m in re.findall(r'"(/_next/static/[^"]+?\.js)"', html_text):
+        bundle_urls.append(f"https://www.oliveyoung.co.kr{m}")
+
+    # 중복 제거 + 우선순위 정렬
+    seen: set = set()
+    unique: list = []
+    for u in bundle_urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+
+    priority_kw = ['review', 'goods', 'detail', 'page', 'gdas']
+    priority = [u for u in unique if any(k in u.lower() for k in priority_kw)]
+    rest = [u for u in unique if u not in priority]
+    ordered = priority + rest
+
+    if log:
+        log(f"ℹ️ JS 번들 {len(ordered)}개 탐색 시작...")
+
+    review_api_re = re.compile(
+        r'["\`](/store/[^"\'`\s]{5,100}?(?:gdas|review|Review|Gdas)[^"\'`\s]*?\.do)["\`]',
+    )
+
+    for url in ordered[:10]:
+        try:
+            resp = session.get(url, headers={"User-Agent": PC_UA, "Accept": "*/*"}, timeout=15)
+            if resp.status_code != 200:
+                continue
+            matches = review_api_re.findall(resp.text)
+            if matches:
+                api_path = matches[0]
+                if log:
+                    log(f"🔑 JS 번들 API 발견: {api_path}")
+                return f"https://www.oliveyoung.co.kr{api_path}"
+        except Exception:
+            pass
+
+    return None
+
+
+# ──────────── 중복 제거 ────────────
+
+def deduplicate_reviews(reviews: list) -> list:
+    seen: set = set()
     result = []
     for r in reviews:
         key = r.get("content", "")[:50]
@@ -389,6 +351,8 @@ def deduplicate_reviews(reviews):
             result.append(r)
     return result
 
+
+# ──────────── 메인 크롤 ────────────
 
 def crawl_reviews(
     goods_no: str,
@@ -409,48 +373,40 @@ def crawl_reviews(
     log(f"ℹ️ curl_cffi: {'사용 중' if HAS_CURL_CFFI else '미설치 (requests 폴백)'}")
     sort = sort_type or "date"
 
-    # 1. 상품 페이지 HTML 수집 (?tab=review 로 접속)
-    log("📦 상품 페이지 수집 중...")
+    # ── 1. 상품 페이지 방문 (쿠키 획득 + 상품명) ──
+    log("📦 상품 페이지 방문 중...")
     progress(0.05)
     product_url = (
         f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
         f"?goodsNo={goods_no}&tab=review"
     )
+    html_text = ""
     try:
-        resp = session.get(product_url, headers=BASE_HEADERS, timeout=20)
-        html_text = resp.text if resp.status_code == 200 else ""
+        resp = session.get(product_url, headers={
+            "User-Agent": PC_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+        }, timeout=20)
+        if resp.status_code == 200:
+            html_text = resp.text
+        else:
+            log(f"⚠️ 상품 페이지 HTTP {resp.status_code}")
     except Exception as e:
         log(f"❌ 상품 페이지 접속 실패: {str(e)[:80]}")
         progress(1.0)
         return "", []
 
-    # RSC 전체 스트림 요청 (Next-Router-Prefetch 없이 → 전체 컴포넌트 데이터)
-    rsc_html = ""
-    try:
-        rsc_resp = session.get(
-            product_url,
-            headers={
-                **BASE_HEADERS,
-                "RSC": "1",
-                "Accept": "text/x-component",
-                # Next-Router-Prefetch 의도적으로 제거
-            },
-            timeout=30,
-        )
-        if rsc_resp.status_code == 200:
-            rsc_html = rsc_resp.text
-    except Exception:
-        pass
-
     # 상품명 추출
     product_name = ""
     title_m = re.search(r"<title>(.*?)</title>", html_text, re.DOTALL)
     if title_m:
-        t = title_m.group(1).strip()
+        t = re.sub(r"<[^>]+>", "", title_m.group(1)).strip()
         for sep in [" | ", " - ", " │ "]:
             if sep in t:
                 product_name = t.split(sep)[0].strip()
                 break
+        if not product_name:
+            product_name = t
     if not product_name:
         nm = re.search(r'class="prd_name[^"]*"[^>]*>(.*?)</[^>]+>', html_text, re.DOTALL)
         if nm:
@@ -459,159 +415,66 @@ def crawl_reviews(
     if product_name:
         log(f"✅ 상품명: {product_name}")
     else:
-        log("⚠️ 상품명을 가져오지 못했습니다.")
-
-    # 2. HTML 구조 진단
+        log("⚠️ 상품명 추출 실패")
     log(f"ℹ️ HTML 크기: {len(html_text)} chars")
-    if rsc_html:
-        log(f"ℹ️ RSC full 응답: {len(rsc_html)} chars")
-        log(f"🔎 RSC 앞부분: {html_lib.escape(rsc_html[:300])}")
 
-    # /_next/data/ 엔드포인트 시도 (Pages Router)
-    nextdata_reviews = []
-    build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html_text)
-    if not build_id_m:
-        build_id_m = re.search(r'/_next/static/([A-Za-z0-9_-]{10,}?)/_buildManifest', html_text)
-    if build_id_m:
-        build_id = build_id_m.group(1)
-        log(f"🔑 Next.js buildId: {build_id}")
-        nextdata_url = (
-            f"https://www.oliveyoung.co.kr/_next/data/{build_id}"
-            f"/store/goods/getGoodsDetail.json"
-        )
-        try:
-            nd_resp = session.get(
-                nextdata_url,
-                params={"goodsNo": goods_no},
-                headers={**AJAX_HEADERS, "x-nextjs-data": "1"},
-                timeout=15,
-            )
-            log(f"ℹ️ /_next/data/ 응답: HTTP {nd_resp.status_code}")
-            if nd_resp.status_code == 200:
-                nd_data = nd_resp.json()
-                _extract_from_json_structure(nd_data, nextdata_reviews)
-                log(f"📄 /_next/data/: {len(nextdata_reviews)}개 리뷰")
-        except Exception as e:
-            log(f"⚠️ /_next/data/ 실패: {str(e)[:60]}")
+    # ── 2. 리뷰 API 직접 호출 ──
+    log("🔍 리뷰 API 호출 중...")
+    progress(0.1)
+
+    page1_reviews, total_count, working_endpoint = _try_review_api(
+        session, goods_no, 1, sort, product_url, log=log,
+    )
+
+    if working_endpoint:
+        log(f"✅ API 엔드포인트: {working_endpoint.split('/')[-1]}")
     else:
-        # HTML 앞부분 디버그 출력
-        preview = html_lib.escape(html_text[:500].replace("\n", " "))
-        log(f"🔎 HTML 앞부분: {preview}")
+        # JS 번들에서 엔드포인트 탐색
+        log("⚠️ 기본 API 실패. JS 번들 탐색 중...")
+        progress(0.2)
+        discovered_ep = _scan_js_for_review_api(session, html_text, log)
 
-    # HTML + RSC에서 리뷰 파싱
-    log("🔍 HTML/RSC에서 리뷰 데이터 탐색 중...")
-    progress(0.15)
-    combined_html = html_text + rsc_html
-    page1_reviews, ajax_url, total_count = _parse_html_for_reviews(combined_html)
-    page1_reviews.extend(nextdata_reviews)
+        if discovered_ep:
+            page1_reviews, total_count, working_endpoint = _try_review_api(
+                session, goods_no, 1, sort, product_url,
+                endpoint=discovered_ep, log=log,
+            )
+            if working_endpoint:
+                log(f"✅ JS 번들 API 성공: {working_endpoint.split('/')[-1]}")
 
-    if ajax_url:
-        log(f"🔗 AJAX 엔드포인트 발견: {ajax_url}")
     if total_count:
         log(f"📊 전체 리뷰 수: {total_count}개")
-    log(f"📄 1페이지: HTML에서 {len(page1_reviews)}개 리뷰 파싱")
+    log(f"📄 1페이지: {len(page1_reviews)}개 리뷰")
     if page1_reviews:
         sample = page1_reviews[0].get("content", "")[:60]
-        log(f"🔎 샘플 리뷰: {html_lib.escape(sample)}")
-
-    # HTML 구조 디버그 (리뷰가 없을 때)
-    if not page1_reviews:
-        # 리뷰 관련 키워드 포함 HTML 조각 탐색
-        keywords = ["review", "gdas", "별점", "리뷰"]
-        for kw in keywords:
-            if kw.lower() in html_text.lower():
-                idx = html_text.lower().find(kw.lower())
-                snippet = html_text[max(0, idx-50):idx+200]
-                snippet_clean = re.sub(r'<[^>]+>', ' ', snippet)[:150].strip()
-                log(f"🔎 '{kw}' 발견 주변: {html_lib.escape(snippet_clean)}")
-                break
+        log(f"🔎 샘플: {html_lib.escape(sample)}")
 
     all_reviews = list(page1_reviews)
 
-    # 3. RSC 페이지네이션으로 추가 페이지 수집
-    if not ajax_url and page1_reviews:
-        log("📋 RSC 스트림 페이지네이션 시작...")
-        consecutive_empty = 0
-        rsc_page = 2
+    if not all_reviews:
+        # HTML 앞부분 디버그 출력
+        if html_text:
+            preview = html_lib.escape(html_text[:300].replace("\n", " "))
+            log(f"🔎 HTML 앞부분: {preview}")
+        log("😢 리뷰를 가져오지 못했습니다.")
+        progress(1.0)
+        return product_name, []
 
-        # 페이지 파라미터 후보 (첫 성공한 것을 계속 사용)
-        page_param_candidates = [
-            "reviewCurrentPage", "page", "reviewPage", "currentPage", "goodsReviewPage"
-        ]
-        working_param = None
+    # ── 3. 페이지네이션 ──
+    if working_endpoint:
+        if total_count:
+            estimated_pages = min(max_pages, -(-total_count // PAGE_SIZE))
+        else:
+            estimated_pages = max_pages
 
-        while rsc_page <= max_pages:
-            page_reviews_found = False
-
-            # 파라미터 후보 순서대로 시도 (working_param 발견 시 고정)
-            params_to_try = [working_param] if working_param else page_param_candidates
-
-            for param_name in params_to_try:
-                try:
-                    paged_url = (
-                        f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
-                        f"?goodsNo={goods_no}&tab=review&{param_name}={rsc_page}"
-                    )
-                    pr = session.get(
-                        paged_url,
-                        headers={**BASE_HEADERS, "RSC": "1", "Accept": "text/x-component"},
-                        timeout=20,
-                    )
-                    if pr.status_code != 200:
-                        continue
-                    rsc_text = pr.text
-                    if len(rsc_text) < 1000:
-                        continue  # 너무 작으면 데이터 없음
-
-                    page_reviews = _parse_rsc_stream(rsc_text)
-                    # HTML 파서도 시도
-                    hr, _, _ = _parse_html_for_reviews(rsc_text)
-                    for r in hr:
-                        if r not in page_reviews:
-                            page_reviews.append(r)
-
-                    if page_reviews:
-                        working_param = param_name
-                        page_reviews_found = True
-
-                        before = len(all_reviews)
-                        for r in page_reviews:
-                            key = r.get("content", "")[:50]
-                            if not any(e.get("content", "")[:50] == key for e in all_reviews):
-                                all_reviews.append(r)
-                        new = len(all_reviews) - before
-
-                        if rsc_page <= 5 or rsc_page % 10 == 0:
-                            log(f"📄 RSC 페이지 {rsc_page}: 수집 {len(page_reviews)}개 | 신규 {new}개 | 누적 {len(all_reviews)}개")
-
-                        progress(0.2 + 0.75 * min(rsc_page / max_pages, 1.0))
-
-                        if new == 0:
-                            consecutive_empty += 1
-                        else:
-                            consecutive_empty = 0
-                        break
-                except Exception:
-                    continue
-
-            if not page_reviews_found:
-                consecutive_empty += 1
-
-            if consecutive_empty >= 3:
-                log(f"✅ RSC 페이지네이션 끝! (페이지 {rsc_page})")
-                break
-
-            rsc_page += 1
-            time.sleep(random.uniform(0.3, 0.7))
-
-    # 4. AJAX URL 발견 시 추가 페이지 수집
-    if ajax_url and total_count > PAGE_SIZE:
-        estimated_pages = min(max_pages, -(-total_count // PAGE_SIZE))
-        log(f"📋 추가 페이지 수집 시작 (최대 {estimated_pages}페이지)...")
+        log(f"📋 페이지네이션 시작 (최대 {estimated_pages}페이지)...")
         consecutive_empty = 0
 
         for page_idx in range(2, estimated_pages + 1):
-            page_reviews = _fetch_ajax_page(session, ajax_url, goods_no, page_idx, sort)
+            page_reviews, _, _ = _try_review_api(
+                session, goods_no, page_idx, sort, product_url,
+                endpoint=working_endpoint,
+            )
 
             before = len(all_reviews)
             for r in page_reviews:
@@ -621,14 +484,14 @@ def crawl_reviews(
             new = len(all_reviews) - before
 
             if page_idx <= 5 or page_idx % 10 == 0:
-                log(f"📄 페이지 {page_idx}: 수집 {len(page_reviews)}개 | 신규 {new}개 | 누적 {len(all_reviews)}개")
+                log(f"📄 페이지 {page_idx}: {len(page_reviews)}개 | 신규 {new}개 | 누적 {len(all_reviews)}개")
 
-            progress(0.2 + 0.75 * (page_idx / estimated_pages))
+            progress(0.15 + 0.8 * min(page_idx / estimated_pages, 1.0))
 
             if not page_reviews or new == 0:
                 consecutive_empty += 1
                 if consecutive_empty >= 3:
-                    log(f"✅ 리뷰 끝! (페이지 {page_idx})")
+                    log(f"✅ 페이지네이션 완료 (페이지 {page_idx})")
                     break
             else:
                 consecutive_empty = 0
