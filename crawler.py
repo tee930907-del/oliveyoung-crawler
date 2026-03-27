@@ -995,9 +995,19 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                if r.get("content")}
             _fetch_failed = False
 
+            # 자연 XHR 캡처 헤더를 재사용 (쿠키 포함) → credentials: include 대신 명시적 헤더 전달
+            _captured_hdrs = info.get("req_headers", {})
+            _eval_hdrs = {
+                k: v for k, v in _captured_hdrs.items()
+                if not k.startswith(":") and k.lower() not in ("content-length",)
+            }
+            # content-type은 항상 JSON으로 덮어씌움
+            _eval_hdrs["content-type"] = "application/json"
             if log:
+                _has_cookie = "cookie" in {k.lower() for k in _eval_hdrs}
                 log(f"🌐 브라우저 checksum fetch: p{_natural_start}~{_pages_per_sort} × "
-                    f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개)...")
+                    f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개, "
+                    f"쿠키포함={_has_cookie})...")
 
             for _sort in _FETCH_SORTS:
                 if len(_all_reviews_js) >= 2000:
@@ -1015,8 +1025,7 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                     try {
                                         const r = await fetch(args.url, {
                                             method: "POST",
-                                            credentials: "include",
-                                            headers: {"Content-Type": "application/json"},
+                                            headers: args.headers,
                                             body: JSON.stringify({
                                                 goodsNumber: args.goodsNo,
                                                 page: p,
@@ -1032,7 +1041,8 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                 return results;
                             }""",
                             {"url": _CHECKSUM_URL, "goodsNo": _goods,
-                             "pages": _pages, "size": _SIZE, "sortType": _sort},
+                             "pages": _pages, "size": _SIZE, "sortType": _sort,
+                             "headers": _eval_hdrs},
                         )
                     except Exception as _fe:
                         if log:
@@ -1046,8 +1056,8 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                             _empty_in_batch += 1
                             continue
                         if "_httpStatus" in _res or "_error" in _res:
-                            if log and _bs == 0:
-                                log(f"⚠️ 브라우저 checksum 오류 ({_sort}): {_res}")
+                            if log:
+                                log(f"⚠️ 브라우저 checksum 오류 ({_sort}, p{_bs}): {_res}")
                             _fetch_failed = True
                             break
                         _api_st = _res.get("status") if isinstance(_res, dict) else None
