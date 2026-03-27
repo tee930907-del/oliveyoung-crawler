@@ -26,6 +26,10 @@ PC_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
+MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
 
 SORT_MAP = {
     "최신순": "date",
@@ -372,6 +376,105 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
     return None
 
 
+# ──────────── 모바일 API ────────────
+
+def _try_mobile_review_api(
+    session,
+    goods_no: str,
+    page: int,
+    sort_code: str,
+    log=None,
+) -> tuple[list[dict], int, str | None]:
+    """
+    m.oliveyoung.co.kr 모바일 리뷰 API 시도.
+    Returns (reviews, total_count, endpoint)
+    """
+    order_map = {"date": "NEW", "useful": "RECOMMEND", "star_desc": "HIGH", "star_asc": "LOW"}
+    order = order_map.get(sort_code, "NEW")
+    mobile_product_url = f"https://m.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={goods_no}"
+
+    # 모바일 세션 별도 생성 (모바일 쿠키 격리)
+    if HAS_CURL_CFFI:
+        msession = cf_requests.Session(impersonate="safari_ios17_2")
+    else:
+        msession = cf_requests.Session()
+
+    # 모바일 상품 페이지 방문 (m. 도메인 쿠키 획득)
+    try:
+        msession.get(mobile_product_url, headers={
+            "User-Agent": MOBILE_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+        }, timeout=15)
+    except Exception:
+        pass
+
+    mobile_headers = {
+        "User-Agent": MOBILE_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer": mobile_product_url,
+        "Origin": "https://m.oliveyoung.co.kr",
+        "Content-Type": "application/json",
+    }
+
+    # (endpoint, method, body) 조합 시도
+    attempts = [
+        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "sortType": order}),
+        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE}),
+        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "GET",
+         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
+         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        ("https://m.oliveyoung.co.kr/store/goods/getGdasReviewList.do", "POST",
+         {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE, "order": order}),
+    ]
+
+    for api_url, method, body in attempts:
+        h = dict(mobile_headers)
+        if method == "GET":
+            h.pop("Content-Type", None)
+        try:
+            if method == "POST":
+                resp = msession.post(api_url, json=body, headers=h, timeout=15)
+            else:
+                resp = msession.get(api_url, params=body, headers=h, timeout=15)
+
+            if log and page == 1:
+                preview = resp.text[:160].replace("\n", " ")
+                label = api_url.split("/")[-1]
+                log(f"🔎 모바일[{resp.status_code}] {method} {label}: {html_lib.escape(preview[:120])}")
+
+            if resp.status_code == 200:
+                text = resp.text.lstrip()
+                if text.startswith(("{", "[")):
+                    data = resp.json()
+                    reviews: list = []
+                    _extract_from_json_structure(data, reviews)
+                    total = 0
+                    if isinstance(data, dict):
+                        for k in ["totalCnt", "totalCount", "total"]:
+                            if data.get(k) is not None:
+                                try:
+                                    total = int(data[k])
+                                    break
+                                except Exception:
+                                    pass
+                        if log and page == 1 and not reviews:
+                            log(f"ℹ️ 모바일 JSON 응답 키: {list(data.keys())[:8]}")
+                    if reviews:
+                        return reviews, total, api_url
+        except Exception as e:
+            if log and page == 1:
+                log(f"⚠️ 모바일 오류: {str(e)[:60]}")
+
+    return [], 0, None
+
+
 # ──────────── 중복 제거 ────────────
 
 def deduplicate_reviews(reviews: list) -> list:
@@ -494,6 +597,16 @@ def crawl_reviews(
             if working_endpoint:
                 log(f"✅ JS 번들 API 성공: {working_endpoint.split('/')[-1]}")
 
+    # ── 2b. 모바일 API 폴백 ──
+    if not working_endpoint:
+        log("🔍 모바일 API 시도 중...")
+        progress(0.35)
+        page1_reviews, total_count, working_endpoint = _try_mobile_review_api(
+            session, goods_no, 1, sort, log=log,
+        )
+        if working_endpoint:
+            log(f"✅ 모바일 API 성공: {working_endpoint.split('/')[-1]}")
+
     if total_count:
         log(f"📊 전체 리뷰 수: {total_count}개")
     log(f"📄 1페이지: {len(page1_reviews)}개 리뷰")
@@ -522,11 +635,18 @@ def crawl_reviews(
         log(f"📋 페이지네이션 시작 (최대 {estimated_pages}페이지)...")
         consecutive_empty = 0
 
+        is_mobile_ep = "m.oliveyoung.co.kr" in working_endpoint
+
         for page_idx in range(2, estimated_pages + 1):
-            page_reviews, _, _ = _try_review_api(
-                session, goods_no, page_idx, sort, product_url,
-                endpoint=working_endpoint,
-            )
+            if is_mobile_ep:
+                page_reviews, _, _ = _try_mobile_review_api(
+                    session, goods_no, page_idx, sort,
+                )
+            else:
+                page_reviews, _, _ = _try_review_api(
+                    session, goods_no, page_idx, sort, product_url,
+                    endpoint=working_endpoint,
+                )
 
             before = len(all_reviews)
             for r in page_reviews:
