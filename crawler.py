@@ -357,17 +357,29 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
         if cdn_url not in bundle_urls:
             bundle_urls.append(cdn_url)
 
-    # buildId: RSC 또는 HTML에서 추출 후 buildManifest 로드
+    # buildId 및 CDN 프리픽스 추출 후 buildManifest 로드
+    # 예: cf-static.oliveyoung.co.kr/lavender/2026032601/_next/static/chunks/xxx.js
     combined = rsc_text + html_text
+    cdn_prefix = ""
+    cdn_prefix_m = re.search(
+        r'(https://cf-static\.oliveyoung\.co\.kr/[a-zA-Z0-9_/-]+?)/_next/static/',
+        combined
+    )
+    if cdn_prefix_m:
+        cdn_prefix = cdn_prefix_m.group(1)  # e.g. https://cf-static.../lavender/2026032601
+
     build_id_m = re.search(r'/_next/static/([a-zA-Z0-9_-]{10,50})/', combined)
     if not build_id_m:
         build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', combined)
     if build_id_m:
         build_id = build_id_m.group(1)
-        for manifest_url in [
-            f"{cdn_base}/_next/static/{build_id}/_buildManifest.js",
+        manifest_candidates = [
             f"https://www.oliveyoung.co.kr/_next/static/{build_id}/_buildManifest.js",
-        ]:
+        ]
+        if cdn_prefix:
+            manifest_candidates.insert(0,
+                f"{cdn_prefix}/_next/static/{build_id}/_buildManifest.js")
+        for manifest_url in manifest_candidates:
             try:
                 mresp = session.get(manifest_url, headers={"User-Agent": PC_UA}, timeout=10)
                 if mresp.status_code == 200 and len(mresp.text) > 100:
@@ -549,34 +561,30 @@ def _try_mobile_review_api(
                      "star_desc": "RATING_DESC", "star_asc": "RATING_ASC"}
     sort_orig = sort_map_orig.get(sort_code)
 
-    # (endpoint, method, origin, body, extra_headers) — extra_headers=None이면 기본만
+    # (endpoint, method, origin, body, extra_headers)
     attempts = [
-        # ★★ 원본 크롤러 파라미터 (goodsNumber + reviewType + page/size)
+        # ★★★ api.dp.oliveyoung.co.kr — JS 번들에서 발견된 새 도메인
+        (f"https://api.dp.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+         "https://www.oliveyoung.co.kr",
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
+        (f"https://api.dp.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
+        (f"https://api.dp.oliveyoung.co.kr/v2/reviews", "POST",
+         "https://www.oliveyoung.co.kr",
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
+        (f"https://api.dp.oliveyoung.co.kr/reviews", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE}, None),
+
+        # 기존 m.oliveyoung 시도
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          "https://www.oliveyoung.co.kr",
          {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
-        # v2 POST no origin
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          None,
          {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
-
-        # ★★ v2 경로 패턴 — WAF 우회 확인됨
-        # 앱 전용 헤더 추가 시도 (BAD_REQUEST 원인 후보)
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
-         {"X-Channel-Gb": "M", "X-App-Gb": "A", "channelGb": "M"}),
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
-         {"X-Requested-With": "co.oliveyoung.app"}),
-        # Chrome UA로 시도 (모바일 UA가 차단되는지 확인)
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
-         {"User-Agent": PC_UA}),
-        # www 도메인으로 시도
-        (f"https://www.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
          {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
         # Next.js API 라우트 가능성
