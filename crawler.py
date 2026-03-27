@@ -1073,7 +1073,17 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                if r.get("content")}
             _fetch_failed = False
 
+            # 리뷰 iframe 감지: 리뷰 XHR이 m.oliveyoung.co.kr iframe에서 발생하면
+            # page.evaluate()는 www.(메인) 컨텍스트라 CORS 차단 → iframe.evaluate() 사용
+            _review_frame = None
+            for _fr in page.frames:
+                if "m.oliveyoung.co.kr" in _fr.url and _fr.url != "about:blank":
+                    _review_frame = _fr
+                    break
+            _eval_ctx = _review_frame if _review_frame else page
             if log:
+                _ctx_label = f"iframe({_review_frame.url[:60]})" if _review_frame else "메인페이지(www.)"
+                log(f"🖼️ evaluate 컨텍스트: {_ctx_label}")
                 log(f"🌐 브라우저 checksum fetch: p{_natural_start}~{_pages_per_sort} × "
                     f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개)...")
 
@@ -1091,7 +1101,7 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                         # fetch() CORS: 서버가 withCredentials 요청에만 Allow-Credentials:true 반환
                         # fetch() without credentials → 서버가 CORS 헤더 미설정 → TypeError
                         # XHR withCredentials=true → 서버가 Allow-Origin:www + Allow-Credentials:true 반환
-                        _results = page.evaluate(
+                        _results = _eval_ctx.evaluate(
                             """async (args) => {
                                 const results = await Promise.all(args.pages.map(p =>
                                     new Promise((resolve) => {
