@@ -26,28 +26,31 @@ REVIEW_API_URL = "https://m.oliveyoung.co.kr/review/api/v2/reviews"
 PAGE_SIZE = 10
 MAX_PAGES = 200
 
+MOBILE_UA = (
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Mobile Safari/537.36"
+)
+
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json",
     "Origin": "https://www.oliveyoung.co.kr",
     "Referer": "https://www.oliveyoung.co.kr/",
+    "User-Agent": MOBILE_UA,
+    "x-requested-with": "XMLHttpRequest",
 }
 
 
 def _create_session():
     """Cloudflare 우회 가능한 세션 생성"""
     if HAS_CURL_CFFI:
-        return cf_requests.Session(impersonate="chrome")
+        session = cf_requests.Session(impersonate="chrome")
     else:
         session = cf_requests.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        })
-        return session
+
+    session.headers.update({"User-Agent": MOBILE_UA})
+    return session
 
 
 def extract_goods_no(url: str) -> str | None:
@@ -275,14 +278,24 @@ def crawl_reviews(
 
     # 1. 상품 페이지 접속 (쿠키 + 상품명)
     log("📦 상품 정보를 가져오는 중...")
-    progress(0.05)
+    progress(0.03)
     product_name = fetch_product_name(session, goods_no)
     if product_name:
         log(f"✅ 상품명: {product_name}")
     else:
         log("⚠️ 상품명을 가져오지 못했습니다. (크롤링은 계속됩니다)")
 
-    # 2. 리뷰 API 호출
+    # 2. 모바일 도메인 warm-up (m.oliveyoung.co.kr 쿠키 취득)
+    progress(0.07)
+    try:
+        session.get(
+            f"https://m.oliveyoung.co.kr/m/goods/getGoodsDetail.do?goodsNo={goods_no}",
+            timeout=15,
+        )
+    except Exception:
+        pass
+
+    # 3. 리뷰 API 호출
     log("🔍 리뷰를 수집하는 중...")
     all_reviews = []
     consecutive_empty = 0
