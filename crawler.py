@@ -783,11 +783,8 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             log(f"🌐 XHR [{request.method}]: {url[:120]}")
 
     def _on_response(response):
-        """실제 리뷰 JSON을 응답한 XHR을 캡처 — URL + 요청 정보 포함."""
-        if info["reviews"]:
-            return
+        """XHR 응답에서 총 리뷰 수와 리뷰 목록을 캡처한다."""
         request = response.request
-        # XHR/fetch 전용
         if request.resource_type not in ("xhr", "fetch"):
             return
         if response.status != 200:
@@ -795,41 +792,82 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
         url = response.url
         if not _looks_like_review_api_url(url):
             return
+
         try:
             ct = response.headers.get("content-type", "")
             if "json" not in ct:
                 return
             body = response.json()
-            reviews: list = []
-            _extract_from_json_structure(body, reviews)
-            if reviews:
-                # ✅ 실제 리뷰 데이터가 있는 응답 → 요청 정보 캡처
-                info["reviews"] = reviews
-                parsed = urlparse(url)
-                info["api_url"] = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-                info["method"] = request.method
-                info["req_headers"] = dict(request.headers)
-                if parsed.query:
-                    info["req_params"] = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-                if request.method == "POST":
+        except Exception:
+            return
+
+        # ── 총 리뷰 수: /stats 또는 /count 엔드포인트에서 먼저 추출 ──
+        if not info["total"] and isinstance(body, dict):
+            for k in ("totalCnt", "totalCount", "total", "totalReviewCount",
+                      "allCnt", "reviewCount", "count", "allReviewCnt"):
+                v = body.get(k)
+                if v is None:
+                    # 1단계 중첩 탐색 (e.g. {"data": {"totalCnt": 500}})
+                    data_node = body.get("data")
+                    if isinstance(data_node, dict):
+                        v = data_node.get(k)
+                if v is not None:
                     try:
-                        body_text = request.post_data or ""
-                        if body_text.startswith("{"):
-                            info["req_body"] = json.loads(body_text)
-                        else:
-                            info["req_body"] = {k: v[0] for k, v in parse_qs(body_text).items()}
+                        info["total"] = int(v)
+                        if log:
+                            log(f"📊 총 리뷰 수 확인 ({url.split('/')[-1]}): {info['total']}개")
                     except Exception:
                         pass
-                if isinstance(body, dict):
-                    for k in ("totalCnt", "totalCount", "total", "totalReviewCount"):
-                        if body.get(k) is not None:
-                            try:
-                                info["total"] = int(body[k])
-                            except Exception:
-                                pass
-                            break
-        except Exception:
+                    break
+
+        # ── 리뷰 목록 캡처 (이미 캡처됐으면 스킵) ──
+        if info["reviews"]:
+            return
+
+        # checksum 엔드포인트는 낮은 우선순위 (더 나은 엔드포인트가 있을 수 있음)
+        is_checksum = "checksum" in url.lower()
+
+        reviews: list = []
+        _extract_from_json_structure(body, reviews)
+
+        if not reviews:
+            return
+
+        if is_checksum and not info["reviews"]:
+            # checksum 응답이지만 다른 엔드포인트 대기 (최대 2초)
+            # → 이미 info["reviews"] 없는 경우에만 임시 저장
             pass
+
+        # ✅ 리뷰 데이터가 있는 응답 → 요청 정보 캡처
+        info["reviews"] = reviews
+        parsed = urlparse(url)
+        info["api_url"] = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        info["method"] = request.method
+        info["req_headers"] = dict(request.headers)
+        if parsed.query:
+            info["req_params"] = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        if request.method == "POST":
+            try:
+                body_text = request.post_data or ""
+                if body_text.startswith("{"):
+                    info["req_body"] = json.loads(body_text)
+                else:
+                    info["req_body"] = {k: v[0] for k, v in parse_qs(body_text).items()}
+            except Exception:
+                pass
+        # 총 수가 아직 없으면 이 응답에서도 시도
+        if not info["total"] and isinstance(body, dict):
+            for k in ("totalCnt", "totalCount", "total", "totalReviewCount",
+                      "allCnt", "reviewCount", "count"):
+                if body.get(k) is not None:
+                    try:
+                        info["total"] = int(body[k])
+                    except Exception:
+                        pass
+                    break
+        if log:
+            log(f"✅ 리뷰 응답 캡처: {info['api_url'].split('/')[-1]} "
+                f"({info['method']}, {len(reviews)}개, 총 {info['total']}개)")
 
     product_url = (
         f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
@@ -877,11 +915,21 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             except Exception:
                 pass
 
-            # 리뷰 API 응답 대기 (최대 8초)
+            # stats/count 응답 대기 (최대 4초) — 총 리뷰 수 확보
+            for _ in range(8):
+                if info["total"]:
+                    break
+                page.wait_for_timeout(500)
+
+            # 리뷰 목록 응답 대기 (추가 최대 8초)
             for _ in range(16):
                 if info["reviews"]:
                     break
                 page.wait_for_timeout(500)
+
+            # 브라우저가 캡처한 총 수 로그
+            if log and info["total"]:
+                log(f"📊 브라우저 캡처 총 리뷰 수: {info['total']}개")
 
             browser.close()
 
