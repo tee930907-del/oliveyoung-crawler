@@ -65,8 +65,8 @@ def extract_goods_no(url: str) -> str | None:
     return None
 
 
-def fetch_product_name(session, goods_no: str) -> str:
-    """상품명 + PC 쿠키 취득"""
+def fetch_product_info(session, goods_no: str) -> tuple[str, str | None]:
+    """상품명 + 상품 페이지 HTML에서 리뷰 API 엔드포인트 동적 탐색"""
     url = (
         f"https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
         f"?goodsNo={goods_no}"
@@ -74,29 +74,60 @@ def fetch_product_name(session, goods_no: str) -> str:
     try:
         resp = session.get(url, timeout=15)
         if resp.status_code != 200:
-            return ""
+            return "", None
 
         html = resp.text
 
+        # 상품명 추출
+        product_name = ""
         title_match = re.search(r"<title>(.*?)</title>", html, re.DOTALL)
         if title_match:
             title_text = title_match.group(1).strip()
             for sep in [" | ", " - ", " │ "]:
                 if sep in title_text:
-                    return title_text.split(sep)[0].strip()
+                    product_name = title_text.split(sep)[0].strip()
+                    break
 
-        name_match = re.search(
-            r'class="prd_name[^"]*"[^>]*>(.*?)</[^>]+>',
-            html, re.DOTALL
-        )
-        if name_match:
-            name = re.sub(r"<[^>]+>", "", name_match.group(1)).strip()
-            if name:
-                return name
+        if not product_name:
+            name_match = re.search(
+                r'class="prd_name[^"]*"[^>]*>(.*?)</[^>]+>',
+                html, re.DOTALL
+            )
+            if name_match:
+                product_name = re.sub(r"<[^>]+>", "", name_match.group(1)).strip()
+
+        # 리뷰 API 엔드포인트 동적 탐색
+        review_endpoint = None
+        # JavaScript 내 URL 패턴 검색 (gdas / review 키워드 포함 .do URL)
+        js_url_patterns = [
+            r'["\']([/]store[/][^"\']*?(?:gdas|Gdas|review|Review)[^"\']*?\.do)["\']',
+            r'url\s*[=:]\s*["\']([^"\']*?(?:gdas|review)[^"\']*?\.do)["\']',
+            r'(?:ajax|Ajax|fetch)\s*\(\s*["\']([^"\']*?(?:gdas|review)[^"\']*?)["\']',
+        ]
+        for pattern in js_url_patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            for m in matches:
+                # 리뷰 목록 조회용 URL만 필터링
+                if any(k in m.lower() for k in ['list', 'search', 'get']):
+                    review_endpoint = (
+                        m if m.startswith('http')
+                        else f"https://www.oliveyoung.co.kr{m}"
+                    )
+                    break
+            if review_endpoint:
+                break
+
+        # 탐색 실패시 알려진 모든 .do URL 로깅용으로 반환
+        if not review_endpoint:
+            all_do_urls = re.findall(r'["\']([/][^"\']*?\.do)["\']', html)
+            unique_urls = list(dict.fromkeys(all_do_urls))[:20]
+            review_endpoint = "||".join(unique_urls)  # 로그용
+
+        return product_name, review_endpoint
 
     except Exception:
         pass
-    return ""
+    return "", None
 
 
 def parse_gdas_review(item: dict) -> dict | None:
@@ -197,14 +228,25 @@ def crawl_reviews(
 
     session = _create_session()
 
-    # 1. 상품 페이지 접속 (PC 쿠키 취득 + 상품명)
+    # 1. 상품 페이지 접속 (PC 쿠키 취득 + 상품명 + 리뷰 엔드포인트 탐색)
     log("📦 상품 정보를 가져오는 중...")
     progress(0.05)
-    product_name = fetch_product_name(session, goods_no)
+    product_name, found_endpoint = fetch_product_info(session, goods_no)
     if product_name:
         log(f"✅ 상품명: {product_name}")
     else:
         log("⚠️ 상품명을 가져오지 못했습니다. (크롤링은 계속됩니다)")
+
+    # 발견된 엔드포인트 처리
+    if found_endpoint and found_endpoint.startswith("https://"):
+        review_api_url = found_endpoint
+        log(f"🔗 리뷰 API 발견: {review_api_url}")
+    else:
+        review_api_url = GDAS_API_URL
+        if found_endpoint:
+            import html as html_lib
+            log(f"🔎 페이지 내 .do URLs: {html_lib.escape(found_endpoint[:300])}")
+        log(f"🔗 기본 엔드포인트 사용: {review_api_url}")
 
     # 2. 리뷰 수집
     log("🔍 리뷰를 수집하는 중...")
@@ -222,7 +264,7 @@ def crawl_reviews(
 
         try:
             resp = session.get(
-                GDAS_API_URL,
+                review_api_url,
                 params=params,
                 timeout=15,
                 headers=HEADERS,
