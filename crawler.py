@@ -931,6 +931,98 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             if log and info["total"]:
                 log(f"📊 브라우저 캡처 총 리뷰 수: {info['total']}개")
 
+            # ── 브라우저 내 JavaScript fetch로 전체 리뷰 수집 ──
+            # 서버 사이드 curl_cffi는 /reviews 에 403 차단됨.
+            # 하지만 실제 브라우저 컨텍스트(cf_clearance 쿠키 포함) 에서 호출하면 허용됨.
+            _MAIN_REVIEW_URL = "https://m.oliveyoung.co.kr/review/api/v2/reviews"
+            _BATCH = 5          # 동시 fetch 수
+            _SIZE  = 50         # 페이지 당 리뷰 수
+            _goods = goods_no
+            _total = info.get("total", 0)
+            _max_pages = min((_total + _SIZE - 1) // _SIZE + 2, 200) if _total else 30
+
+            if log:
+                log(f"🌐 브라우저 fetch: {_max_pages}페이지 × {_SIZE}개 수집 시작...")
+
+            _all_reviews_js: list = []
+            _fetch_failed = False
+
+            for _bs in range(0, _max_pages, _BATCH):
+                _be = min(_bs + _BATCH, _max_pages)
+                _pages = list(range(_bs, _be))
+                try:
+                    _results = page.evaluate(
+                        """async (args) => {
+                            const results = await Promise.all(args.pages.map(async p => {
+                                try {
+                                    const r = await fetch(args.url, {
+                                        method: "POST",
+                                        headers: {"Content-Type": "application/json"},
+                                        body: JSON.stringify({
+                                            goodsNumber: args.goodsNo,
+                                            page: p,
+                                            size: args.size,
+                                            reviewType: "ALL",
+                                            sortType: "NEW"
+                                        })
+                                    });
+                                    if (!r.ok) return {_httpStatus: r.status};
+                                    return await r.json();
+                                } catch(e) { return {_error: String(e)}; }
+                            }));
+                            return results;
+                        }""",
+                        {"url": _MAIN_REVIEW_URL, "goodsNo": _goods,
+                         "pages": _pages, "size": _SIZE},
+                    )
+                except Exception as _fe:
+                    if log:
+                        log(f"⚠️ 브라우저 fetch 배치 오류: {str(_fe)[:80]}")
+                    _fetch_failed = True
+                    break
+
+                _empty_in_batch = 0
+                for _res in (_results or []):
+                    if not isinstance(_res, dict):
+                        _empty_in_batch += 1
+                        continue
+                    if "_httpStatus" in _res or "_error" in _res:
+                        if log and _bs == 0:
+                            log(f"⚠️ 브라우저 fetch 응답 오류: {_res}")
+                        _fetch_failed = True
+                        break
+                    _batch_revs: list = []
+                    _extract_from_json_structure(_res, _batch_revs)
+                    if _batch_revs:
+                        _all_reviews_js.extend(_batch_revs)
+                    else:
+                        _empty_in_batch += 1
+                if _fetch_failed:
+                    break
+                if log and (_bs % 25 == 0):
+                    log(f"📄 배치 {_bs}-{_be-1}: {len(_all_reviews_js)}개 누적")
+                # 배치 내 모든 페이지가 비어있으면 종료
+                if _empty_in_batch == len(_pages):
+                    break
+
+            if _all_reviews_js and not _fetch_failed:
+                if log:
+                    log(f"✅ 브라우저 fetch 완료: {len(_all_reviews_js)}개 리뷰")
+                info["reviews"] = _all_reviews_js
+                info["api_url"] = _MAIN_REVIEW_URL
+                info["method"] = "POST"
+                info["req_body"] = {
+                    "goodsNumber": goods_no, "page": 0, "size": _SIZE,
+                    "reviewType": "ALL", "sortType": "NEW",
+                }
+                info["page_param"] = "page"
+                info["page_base"] = 0
+                info["page_size"] = _SIZE
+                info["all_fetched"] = True
+            else:
+                if log:
+                    log("⚠️ 브라우저 fetch 실패 → checksum 폴백 사용")
+
             browser.close()
 
     except Exception as e:
@@ -1308,7 +1400,13 @@ def crawl_reviews(
         progress(1.0)
         return product_name, []
 
-    # ── 3. 페이지네이션 ──
+    # ── 3. 페이지네이션 (브라우저 fetch가 이미 전부 수집한 경우 스킵) ──
+    if playwright_info and playwright_info.get("all_fetched"):
+        all_reviews = deduplicate_reviews(list(page1_reviews))
+        progress(1.0)
+        log(f"🎉 수집 완료! 총 {len(all_reviews)}개 리뷰 (브라우저 fetch)")
+        return product_name, all_reviews
+
     if working_endpoint:
         if total_count:
             estimated_pages = min(max_pages, -(-total_count // PAGE_SIZE))
