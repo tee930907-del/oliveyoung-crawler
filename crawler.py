@@ -347,24 +347,35 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
         bundle_urls.append(f"https://www.oliveyoung.co.kr{m}")
 
     # ★ Next.js buildManifest에서 페이지별 동적 청크 추가
-    build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html_text)
+    # CDN 도메인 추출 (cf-static.oliveyoung.co.kr 등)
+    cdn_domain_m = re.search(r'(https://cf-static\.oliveyoung\.co\.kr)', html_text)
+    cdn_base = cdn_domain_m.group(1) if cdn_domain_m else "https://www.oliveyoung.co.kr"
+
+    # buildId: CDN URL 패턴에서 추출
+    build_id_m = re.search(r'/_next/static/([a-zA-Z0-9_-]{10,50})/', html_text)
     if not build_id_m:
-        build_id_m = re.search(r'/_next/static/([a-zA-Z0-9_-]{10,40})/', html_text)
+        build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html_text)
     if build_id_m:
         build_id = build_id_m.group(1)
-        manifest_url = f"https://www.oliveyoung.co.kr/_next/static/{build_id}/_buildManifest.js"
-        try:
-            mresp = session.get(manifest_url, headers={"User-Agent": PC_UA}, timeout=10)
-            if mresp.status_code == 200:
-                # buildManifest에서 모든 청크 URL 추출
-                for chunk in re.findall(r'"(/_next/static/chunks/[^"]+\.js)"', mresp.text):
-                    full = f"https://www.oliveyoung.co.kr{chunk}"
-                    if full not in bundle_urls:
-                        bundle_urls.append(full)
-                if log:
-                    log(f"ℹ️ buildManifest 청크 추가 ({build_id[:8]}...): 총 {len(bundle_urls)}개")
-        except Exception:
-            pass
+        for manifest_url in [
+            f"{cdn_base}/_next/static/{build_id}/_buildManifest.js",
+            f"https://www.oliveyoung.co.kr/_next/static/{build_id}/_buildManifest.js",
+        ]:
+            try:
+                mresp = session.get(manifest_url, headers={"User-Agent": PC_UA}, timeout=10)
+                if mresp.status_code == 200 and len(mresp.text) > 100:
+                    before = len(bundle_urls)
+                    for chunk in re.findall(r'"(/_next/static/chunks/[^"]+\.js)"', mresp.text):
+                        for base in [cdn_base, "https://www.oliveyoung.co.kr"]:
+                            full = f"{base}{chunk}"
+                            if full not in bundle_urls:
+                                bundle_urls.append(full)
+                    added = len(bundle_urls) - before
+                    if log:
+                        log(f"ℹ️ buildManifest ({build_id[:8]}): +{added}개 청크 추가")
+                    break
+            except Exception:
+                pass
 
     # 중복 제거
     seen: set = set()
@@ -396,12 +407,14 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
         re.compile(r'["\`]((?:/[a-zA-Z0-9_-]{1,40}){1,6}/(?:review|gdas)(?:s|List|[a-zA-Z0-9_-]*)?)["\`]', re.IGNORECASE),
     ]
 
-    for url in ordered[:15]:
+    for url in ordered[:20]:
         try:
             resp = session.get(url, headers={"User-Agent": PC_UA, "Accept": "*/*"}, timeout=15)
             if resp.status_code != 200:
                 continue
             bundle_text = resp.text
+            if log and len(bundle_text) < 500:
+                log(f"📦 소형번들[{len(bundle_text)}]: {html_lib.escape(bundle_text[:80])}")
 
             for p in url_patterns:
                 matches = p.findall(bundle_text)
