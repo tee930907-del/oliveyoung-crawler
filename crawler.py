@@ -827,11 +827,8 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                         pass
                     break
 
-        # ── 리뷰 목록 캡처 (이미 캡처됐으면 스킵) ──
-        if info["reviews"]:
-            return
-
-        # checksum 엔드포인트는 낮은 우선순위 (더 나은 엔드포인트가 있을 수 있음)
+        # ── 리뷰 목록 캡처 ──
+        # checksum은 모든 XHR 응답 누적 (자연 스크롤로 여러 페이지가 자동 호출됨)
         is_checksum = "checksum" in url.lower()
 
         reviews: list = []
@@ -840,13 +837,26 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
         if not reviews:
             return
 
-        if is_checksum and not info["reviews"]:
-            # checksum 응답이지만 다른 엔드포인트 대기 (최대 2초)
-            # → 이미 info["reviews"] 없는 경우에만 임시 저장
-            pass
+        # 같은 checksum 엔드포인트에서 추가 XHR이 오면 누적
+        if is_checksum and info["api_url"]:
+            new_added = 0
+            for r in reviews:
+                key = r.get("content", "")[:50]
+                if key and not any(e.get("content", "")[:50] == key for e in info["reviews"]):
+                    info["reviews"].append(r)
+                    new_added += 1
+            info["natural_xhrs"] = info.get("natural_xhrs", 1) + 1
+            if log and new_added > 0:
+                log(f"📥 XHR 추가 캡처: +{new_added}개 (누적 {len(info['reviews'])}개)")
+            return
 
-        # ✅ 리뷰 데이터가 있는 응답 → 요청 정보 캡처
+        # 이미 다른 엔드포인트로 캡처됐으면 스킵
+        if info["reviews"]:
+            return
+
+        # ✅ 리뷰 데이터가 있는 응답 → 요청 정보 캡처 (첫 번째만)
         info["reviews"] = reviews
+        info["natural_xhrs"] = 1
         parsed = urlparse(url)
         info["api_url"] = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         info["method"] = request.method
@@ -934,9 +944,15 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                     break
                 page.wait_for_timeout(500)
 
+            # 자연 XHR 추가 캡처 대기: 페이지가 연속으로 여러 checksum 호출 → 2초 더 대기
+            if info["reviews"]:
+                page.wait_for_timeout(2000)
+
             # 브라우저가 캡처한 총 수 로그
             if log and info["total"]:
                 log(f"📊 브라우저 캡처 총 리뷰 수: {info['total']}개")
+            if log and info.get("natural_xhrs", 0) > 1:
+                log(f"📥 자연 XHR 총 {info['natural_xhrs']}페이지 → {len(info['reviews'])}개 선수집")
 
             # ── 브라우저 내 JavaScript fetch로 checksum 다중 수집 ──
             # /reviews 는 CORS 차단. /checksum 은 브라우저에서 허용됨.
@@ -952,18 +968,22 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             _pages_per_sort = min(70, (-(-_total // _SIZE) + 2)) if _total else 50
             _FETCH_SORTS = ["USEFUL_SCORE_DESC", "RATING_DESC", "RATING_ASC"]
 
-            if log:
-                log(f"🌐 브라우저 checksum fetch: {_pages_per_sort}페이지 × {len(_FETCH_SORTS)}정렬 수집 시작...")
-
-            _all_reviews_js: list = []
-            _seen_keys: set = set()
+            # 자연 XHR로 이미 수집한 리뷰 포함 시작 (dedup 포함)
+            _natural_start = info.get("natural_xhrs", 0)
+            _all_reviews_js: list = list(info.get("reviews", []))
+            _seen_keys: set = {r.get("content", "")[:50] for r in _all_reviews_js
+                               if r.get("content")}
             _fetch_failed = False
+
+            if log:
+                log(f"🌐 브라우저 checksum fetch: p{_natural_start}~{_pages_per_sort} × "
+                    f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개)...")
 
             for _sort in _FETCH_SORTS:
                 if len(_all_reviews_js) >= 2000:
                     break
                 _sort_consec_empty = 0
-                for _bs in range(0, _pages_per_sort, _BATCH):
+                for _bs in range(_natural_start, _pages_per_sort, _BATCH):
                     if len(_all_reviews_js) >= 2000:
                         break
                     _be = min(_bs + _BATCH, _pages_per_sort)
@@ -975,6 +995,7 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                     try {
                                         const r = await fetch(args.url, {
                                             method: "POST",
+                                            credentials: "include",
                                             headers: {"Content-Type": "application/json"},
                                             body: JSON.stringify({
                                                 goodsNumber: args.goodsNo,
@@ -1038,9 +1059,12 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                 if log:
                     log(f"📋 브라우저 checksum {_sort}: {len(_all_reviews_js)}개 누적")
 
-            if _all_reviews_js and not _fetch_failed:
+            # evaluate() 실패해도 자연 XHR로 모은 리뷰가 있으면 사용
+            _eval_got_new = len(_all_reviews_js) > len(info.get("reviews", []))
+            if _all_reviews_js and (_eval_got_new or not _fetch_failed):
                 if log:
-                    log(f"✅ 브라우저 checksum fetch 완료: {len(_all_reviews_js)}개 리뷰")
+                    status_str = "일부 실패" if _fetch_failed else "완료"
+                    log(f"✅ 브라우저 checksum fetch {status_str}: {len(_all_reviews_js)}개 리뷰")
                 info["reviews"] = _all_reviews_js
                 info["api_url"] = _CHECKSUM_URL
                 info["method"] = "POST"
