@@ -46,19 +46,17 @@ _SORT_ORDER = {
     "star_asc": "LOW",
 }
 
-# 시도할 리뷰 API 엔드포인트 목록 (POST/GET 모두 시도)
+# 시도할 리뷰 API 엔드포인트 목록
+# 커뮤니티 역공학 결과: /store/product/ 경로 + pageIdx/rowsPerPage/sortCode 파라미터
 _REVIEW_ENDPOINTS = [
-    # Spring MVC .do 후보
+    # ★ 핵심: /store/product/ 경로 (pageIdx/rowsPerPage/sortCode 파라미터)
+    "https://www.oliveyoung.co.kr/store/product/getGdasReviewList.do",
+    # 변형 경로들
     "https://www.oliveyoung.co.kr/store/goods/getGdasReviewList.do",
+    "https://www.oliveyoung.co.kr/store/product/getGoodsGdasList.do",
     "https://www.oliveyoung.co.kr/store/goods/getGoodsGdasList.do",
     "https://www.oliveyoung.co.kr/store/review/getReviewList.do",
     "https://www.oliveyoung.co.kr/store/goods/getGdasSearchList.do",
-    "https://www.oliveyoung.co.kr/store/goods/getGoodsCriteriaReviewList.do",
-    # Next.js API Route 후보
-    "https://www.oliveyoung.co.kr/api/review/list",
-    "https://www.oliveyoung.co.kr/api/reviews",
-    "https://www.oliveyoung.co.kr/api/goods/review",
-    "https://www.oliveyoung.co.kr/api/goods/reviews",
 ]
 
 
@@ -97,7 +95,7 @@ def _parse_review_dict(item: dict) -> dict | None:
     review = {}
 
     # 구체적인 리뷰 필드 우선 (오탐 없음)
-    specific_keys = ["reviewContent", "gdasContent", "reviewText", "reviewBody", "contText"]
+    specific_keys = ["gdasContents", "reviewContent", "gdasContent", "reviewText", "reviewBody", "contText"]
     generic_keys = ["content", "body", "text"]
 
     for k in specific_keys:
@@ -121,7 +119,7 @@ def _parse_review_dict(item: dict) -> dict | None:
                 review["content"] = val
                 break
 
-    for k in ["reviewScore", "gdasStar", "rating", "score", "starScore", "starPoint",
+    for k in ["gdasScore", "reviewScore", "gdasStar", "rating", "score", "starScore", "starPoint",
               "ratingValue"]:
         if item.get(k) is not None:
             review["rating"] = str(item[k])
@@ -143,12 +141,12 @@ def _parse_review_dict(item: dict) -> dict | None:
         elif author_val:
             review["author"] = str(author_val).strip()
     if "author" not in review:
-        for k in ["membNickName", "nickName", "nickname", "memberNickname", "userName"]:
+        for k in ["memberNickName", "membNickName", "nickName", "nickname", "memberNickname", "userName"]:
             if item.get(k):
                 review["author"] = str(item[k]).strip()
                 break
 
-    for k in ["registDate", "createDate", "regDate", "createdDateTime",
+    for k in ["regDate", "registDate", "createDate", "createdDateTime",
               "writtenDate", "createdAt", "datePublished"]:
         if item.get(k):
             review["date"] = str(item[k]).strip()
@@ -260,10 +258,12 @@ def _try_review_api(
     endpoints_to_try = [endpoint] if endpoint else _REVIEW_ENDPOINTS
 
     param_sets = [
+        # 커뮤니티 역공학 결과 (pageIdx/rowsPerPage/sortCode)
+        {"goodsNo": goods_no, "pageIdx": page, "rowsPerPage": PAGE_SIZE, "sortCode": order},
+        # 기존 형태 (pagingIndex/pagingSize/order)
         {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE, "order": order},
-        {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE, "sortType": order},
         {"goodsNo": goods_no, "pagingIndex": page, "pagingSize": PAGE_SIZE},
-        {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "order": order},
+        {"goodsNo": goods_no, "pageIdx": page, "rowsPerPage": PAGE_SIZE},
     ]
 
     # 엔드포인트당 첫 번째 응답만 로그 (노이즈 감소)
