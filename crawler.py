@@ -483,7 +483,7 @@ def _try_mobile_review_api(
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          None,
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v1 + m origin (JSON 응답 확인됨 — NOT_FOUND → 파라미터/ID 변형)
+        # v1 POST (JSON 응답 확인됨 — NOT_FOUND)
         ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
          "https://m.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
@@ -491,11 +491,22 @@ def _try_mobile_review_api(
         ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
          "https://m.oliveyoung.co.kr",
          {"goodsNo": goods_no_num, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v1 GET
+        # v1 GET (쿼리 파라미터)
         ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "GET",
          "https://m.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v2 + m origin (403이지만 혹시 쿠키 있을 때 달라질 수도)
+        # ★ REST 경로 패턴: /reviews/{goodsNo}
+        (f"https://m.oliveyoung.co.kr/review/api/v1/reviews/{goods_no}", "GET",
+         "https://m.oliveyoung.co.kr",
+         {"pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        (f"https://m.oliveyoung.co.kr/review/api/v1/reviews/{goods_no_num}", "GET",
+         "https://m.oliveyoung.co.kr",
+         {"pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        # v2 경로 패턴: /reviews/{goodsNo}
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+        # v2 + m origin
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          "https://m.oliveyoung.co.kr",
          {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
@@ -529,7 +540,10 @@ def _try_mobile_review_api(
 
             if log and page == 1:
                 preview = resp.text[:160].replace("\n", " ")
-                label = f"v{'2' if 'v2' in api_url else '1'} origin={origin.split('.')[-2] if origin else 'none'}"
+                ver = "v2" if "v2" in api_url else "v1"
+                orig = origin.split("/")[2].replace("m.oliveyoung.co.kr", "m").replace("www.oliveyoung.co.kr", "www") if origin else "none"
+                path_style = "path" if api_url.split("/reviews/", 1)[-1] not in ("", "reviews") and "/reviews/" in api_url else method
+                label = f"{ver} {path_style} {orig}"
                 log(f"🔎 모바일[{resp.status_code}] {label}: {html_lib.escape(preview[:100])}")
 
             if resp.status_code == 200:
