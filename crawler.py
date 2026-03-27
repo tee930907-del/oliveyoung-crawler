@@ -445,23 +445,41 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
                         ctx = bundle_text[max(0, idx - 20):idx + 80].replace('\n', ' ')
                         log(f"📦 [{fname}] {html_lib.escape(ctx[:90])}")
 
-                    # ★ 이 번들이 리뷰 코드 포함 → 더 깊이 탐색
-                    for search_term in ['goodsNumber', 'reviewType', 'review/api', 'goodsNo']:
-                        si = bundle_text.find(search_term)
-                        if si >= 0:
-                            ctx2 = bundle_text[max(0, si - 60):si + 120].replace('\n', ' ')
-                            if log:
-                                log(f"🔍 [{fname}|{search_term}]: {html_lib.escape(ctx2[:150])}")
+                    # ★ 이 번들이 리뷰 코드 포함 → 리뷰 탭 주변 500자 덤프
+                    ctx_wide = bundle_text[max(0, idx - 50):idx + 450].replace('\n', ' ')
+                    if log:
+                        log(f"🔍 [{fname} 주변]: {html_lib.escape(ctx_wide[:400])}")
 
-                    # fetch/axios URL 패턴 전체 재탐색 (더 넓은 패턴)
-                    extra_patterns = [
-                        re.compile(r'["\`]((?:https?:)?//[^\s"\'`]{5,100}(?:review|gdas)[^\s"\'`]{0,50})["\`]', re.I),
-                        re.compile(r'["\`](/[a-z0-9/_-]{3,80}(?:review|gdas)[a-z0-9/_-]{0,50})["\`]', re.I),
-                    ]
-                    for ep in extra_patterns:
-                        for m in ep.findall(bundle_text):
-                            if log:
-                                log(f"🔑 번들 URL 후보: {html_lib.escape(m[:100])}")
+                    # 동적 임포트 청크 ID 탐색 (webpack: n.e(ID) or __webpack_require__.e(ID))
+                    chunk_ids = re.findall(r'\.e\((\d+)\)', bundle_text[max(0, idx-2000):idx+2000])
+                    if log and chunk_ids:
+                        log(f"🔍 동적청크 ID 후보: {chunk_ids[:10]}")
+
+                    # webpack 청크맵: {숫자:"해시"} 패턴 탐색
+                    chunk_map_m = re.search(
+                        r'\{(?:\d+:"[a-f0-9]+",?\s*){3,}\}',
+                        bundle_text[max(0, idx-5000):idx+5000]
+                    )
+                    if chunk_map_m and log:
+                        log(f"🔍 청크맵: {html_lib.escape(chunk_map_m.group()[:200])}")
+
+                    # oliveyoung 도메인 포함 URL 탐색
+                    oy_urls = re.findall(
+                        r'["\`]((?:https?:)?//[^\s"\'`\\]{5,120}oliveyoung[^\s"\'`\\]{0,80})["\`]',
+                        bundle_text
+                    )
+                    for u in oy_urls[:5]:
+                        if log:
+                            log(f"🔑 oliveyoung URL: {html_lib.escape(u[:120])}")
+
+                    # /review/ 또는 /api/ 경로 탐색
+                    api_paths = re.findall(
+                        r'["\`](/(?:review|api)/[^\s"\'`\\]{3,80})["\`]',
+                        bundle_text
+                    )
+                    for p in api_paths[:5]:
+                        if log:
+                            log(f"🔑 API 경로 후보: {html_lib.escape(p[:100])}")
                     break
 
             if log and not found_kw and ordered.index(url) == 0:
