@@ -974,11 +974,66 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                 if log and len(info["reviews"]) > (info.get("natural_xhrs", 1) * 10):
                     log(f"🖱️ 스크롤 수집 완료: {len(info['reviews'])}개")
 
-            # ── 브라우저 내 JavaScript fetch로 checksum 다중 수집 ──
-            # /reviews 는 CORS 차단. /checksum 은 브라우저에서 허용됨.
-            # (서버가 Origin: www.oliveyoung.co.kr 허용 — Playwright XHR 캡처로 확인)
-            # curl_cffi replay는 Playwright 쿠키를 재사용 → 서버가 page≥2부터 빈 응답.
-            # 브라우저 컨텍스트(실제 쿠키)에서 직접 호출하면 deep pagination 가능.
+            # ── 정렬 버튼 클릭 → 새 스크롤 세션으로 추가 리뷰 수집 ──
+            # 서버가 세션당 ~30페이지(300개)로 제한 → 정렬 변경 시 새 세션으로 리셋
+            _sort_labels = [
+                # (sortType, 가능한 버튼 텍스트/셀렉터 목록)
+                ("RATING_DESC", [
+                    "button:has-text('평점높은순')", "button:has-text('평점 높은순')",
+                    "li:has-text('평점높은순') > a", "li:has-text('평점 높은순') > a",
+                    "a:has-text('평점높은순')", "a:has-text('평점 높은순')",
+                    "[data-sort-type='RATING_DESC']", "[data-sorttype='RATING_DESC']",
+                    "li[data-value='RATING_DESC']", "button[value='RATING_DESC']",
+                ]),
+                ("RATING_ASC", [
+                    "button:has-text('평점낮은순')", "button:has-text('평점 낮은순')",
+                    "li:has-text('평점낮은순') > a", "li:has-text('평점 낮은순') > a",
+                    "a:has-text('평점낮은순')", "a:has-text('평점 낮은순')",
+                    "[data-sort-type='RATING_ASC']", "[data-sorttype='RATING_ASC']",
+                    "li[data-value='RATING_ASC']", "button[value='RATING_ASC']",
+                ]),
+            ]
+            for _slabel, _selectors in _sort_labels:
+                if len(info["reviews"]) >= 2000:
+                    break
+                _btn_clicked = False
+                for _sel in _selectors:
+                    try:
+                        _elem = page.locator(_sel).first
+                        if _elem.is_visible(timeout=1_500):
+                            _elem.click(timeout=3_000)
+                            _btn_clicked = True
+                            if log:
+                                log(f"🔃 정렬 변경: {_slabel} (버튼: {_sel})")
+                            break
+                    except Exception:
+                        continue
+                if not _btn_clicked:
+                    continue
+                # 새 정렬로 XHR 재발생 대기
+                page.wait_for_timeout(2_000)
+                # 스크롤로 새 정렬 XHR 수집
+                _stale_scrolls = 0
+                _prev_scroll_count = len(info["reviews"])
+                for _scroll_i in range(120):
+                    if len(info["reviews"]) >= 2000:
+                        break
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(300)
+                    if len(info["reviews"]) > _prev_scroll_count:
+                        _stale_scrolls = 0
+                        _prev_scroll_count = len(info["reviews"])
+                    else:
+                        _stale_scrolls += 1
+                        if _stale_scrolls >= 10:
+                            break
+                if log:
+                    log(f"🖱️ {_slabel} 스크롤 완료: {len(info['reviews'])}개 누적")
+
+            # ── 브라우저 내 JavaScript fetch로 checksum 다중 수집 (자격증명 없음) ──
+            # credentials:"include" → CORS TypeError (서버가 Allow-Credentials: true 미설정)
+            # credentials 없이 → Access-Control-Allow-Origin: * 허용이면 성공
+            # context.request.post() → TLS 지문 다름 → 403
             _CHECKSUM_URL = "https://m.oliveyoung.co.kr/review/api/v2/reviews/checksum"
             _BATCH = 5
             _SIZE = 10          # checksum 안정 크기
@@ -995,17 +1050,6 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                                if r.get("content")}
             _fetch_failed = False
 
-            # context.request.post() 사용: 브라우저 쿠키 공유 + CORS 우회 (Python측 HTTP 클라이언트)
-            # page.evaluate() fetch는 cross-origin(www→m)에서 credentialed CORS가 차단되어 실패함
-            # 자연 XHR 캡처 헤더 재사용: sec-fetch-*, sec-ch-ua-*, accept 등 브라우저 지문 헤더 포함
-            _req_hdrs = {
-                k: v for k, v in info.get("req_headers", {}).items()
-                if not k.startswith(":") and k.lower() not in ("content-length", "cookie")
-            }
-            _req_hdrs["content-type"] = "application/json"
-            _req_hdrs.setdefault("referer", product_url)
-            _req_hdrs.setdefault("origin", "https://www.oliveyoung.co.kr")
-            _req_hdrs.setdefault("user-agent", PC_UA)
             if log:
                 log(f"🌐 브라우저 checksum fetch: p{_natural_start}~{_pages_per_sort} × "
                     f"{len(_FETCH_SORTS)}정렬 (선수집 {len(_all_reviews_js)}개)...")
@@ -1019,29 +1063,41 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                         break
                     _be = min(_bs + _BATCH, _pages_per_sort)
                     _pages = list(range(_bs, _be))
-                    _results = []
-                    for _pnum in _pages:
-                        try:
-                            _resp = context.request.post(
-                                _CHECKSUM_URL,
-                                data=json.dumps({
-                                    "goodsNumber": _goods,
-                                    "page": _pnum,
-                                    "size": _SIZE,
-                                    "reviewType": "ALL",
-                                    "sortType": _sort,
-                                }),
-                                headers=_req_hdrs,
-                            )
-                            if _resp.ok:
-                                _results.append(_resp.json())
-                            else:
-                                _results.append({"_httpStatus": _resp.status})
-                        except Exception as _fe:
-                            _results.append({"_error": str(_fe)[:80]})
+                    try:
+                        # credentials 없이 → CORS Allow-Origin:* 허용 (credentials:"include" 는 CORS TypeError)
+                        # context.request.post() 는 TLS 지문 달라 403 → page.evaluate fetch 사용
+                        _results = page.evaluate(
+                            """async (args) => {
+                                const results = await Promise.all(args.pages.map(async p => {
+                                    try {
+                                        const r = await fetch(args.url, {
+                                            method: "POST",
+                                            headers: {"Content-Type": "application/json"},
+                                            body: JSON.stringify({
+                                                goodsNumber: args.goodsNo,
+                                                page: p,
+                                                size: args.size,
+                                                reviewType: "ALL",
+                                                sortType: args.sortType,
+                                            })
+                                        });
+                                        if (!r.ok) return {_httpStatus: r.status};
+                                        return await r.json();
+                                    } catch(e) { return {_error: String(e)}; }
+                                }));
+                                return results;
+                            }""",
+                            {"url": _CHECKSUM_URL, "goodsNo": _goods,
+                             "pages": _pages, "size": _SIZE, "sortType": _sort},
+                        )
+                    except Exception as _fe:
+                        if log:
+                            log(f"⚠️ 브라우저 checksum 배치 오류 ({_sort}): {str(_fe)[:80]}")
+                        _fetch_failed = True
+                        break
 
                     _empty_in_batch = 0
-                    for _res in _results:
+                    for _res in (_results or []):
                         if not isinstance(_res, dict):
                             _empty_in_batch += 1
                             continue
