@@ -763,47 +763,37 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
     }
 
     REVIEW_KWS = ("review", "gdas", "getGdas", "getReview")
+    # 리뷰 API가 아닌 URL을 걸러내는 키워드 (상품 페이지 HTML 등)
+    REVIEW_EXCL = ("getGoodsDetail", "getGoodsList", "goodsDetail.do", "goodsList.do")
 
-    def _looks_like_review_url(url: str) -> bool:
+    def _looks_like_review_api_url(url: str) -> bool:
         low = url.lower()
-        if any(ext in low for ext in (".js", ".css", ".png", ".jpg", ".svg", ".woff")):
+        if any(ext in low for ext in (".js", ".css", ".png", ".jpg", ".svg", ".woff", ".ico")):
+            return False
+        if any(excl.lower() in low for excl in REVIEW_EXCL):
             return False
         return any(kw.lower() in low for kw in REVIEW_KWS)
 
     def _on_request(request):
-        if info["api_url"]:
+        """XHR/fetch 요청 디버그 로그 (모든 XHR을 기록)."""
+        if request.resource_type not in ("xhr", "fetch"):
             return
         url = request.url
-        if not _looks_like_review_url(url):
-            return
-        # Skip JS bundle fetches
-        if url.endswith(".js"):
-            return
-        info["method"] = request.method
-        info["req_headers"] = dict(request.headers)
-        parsed = urlparse(url)
-        info["api_url"] = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        if parsed.query:
-            info["req_params"] = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-        if request.method == "POST":
-            try:
-                body_text = request.post_data or ""
-                if body_text.startswith("{"):
-                    info["req_body"] = json.loads(body_text)
-                else:
-                    info["req_body"] = {k: v[0] for k, v in parse_qs(body_text).items()}
-            except Exception:
-                pass
+        if log:
+            log(f"🌐 XHR [{request.method}]: {url[:120]}")
 
     def _on_response(response):
+        """실제 리뷰 JSON을 응답한 XHR을 캡처 — URL + 요청 정보 포함."""
         if info["reviews"]:
+            return
+        request = response.request
+        # XHR/fetch 전용
+        if request.resource_type not in ("xhr", "fetch"):
             return
         if response.status != 200:
             return
         url = response.url
-        if not _looks_like_review_url(url):
-            return
-        if url.endswith(".js"):
+        if not _looks_like_review_api_url(url):
             return
         try:
             ct = response.headers.get("content-type", "")
@@ -813,7 +803,23 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
             reviews: list = []
             _extract_from_json_structure(body, reviews)
             if reviews:
+                # ✅ 실제 리뷰 데이터가 있는 응답 → 요청 정보 캡처
                 info["reviews"] = reviews
+                parsed = urlparse(url)
+                info["api_url"] = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                info["method"] = request.method
+                info["req_headers"] = dict(request.headers)
+                if parsed.query:
+                    info["req_params"] = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+                if request.method == "POST":
+                    try:
+                        body_text = request.post_data or ""
+                        if body_text.startswith("{"):
+                            info["req_body"] = json.loads(body_text)
+                        else:
+                            info["req_body"] = {k: v[0] for k, v in parse_qs(body_text).items()}
+                    except Exception:
+                        pass
                 if isinstance(body, dict):
                     for k in ("totalCnt", "totalCount", "total", "totalReviewCount"):
                         if body.get(k) is not None:
