@@ -463,77 +463,47 @@ def _try_mobile_review_api(
         if rsc_ids and log and page == 1:
             log(f"ℹ️ RSC 내 상품ID 변형: {rsc_ids[:5]}")
 
+    # 정렬 코드 변환 (원본 크롤러 형식)
+    sort_map_orig = {"date": None, "useful": "USEFUL_SCORE_DESC",
+                     "star_desc": "RATING_DESC", "star_asc": "RATING_ASC"}
+    sort_orig = sort_map_orig.get(sort_code)
+
     # (endpoint, method, origin, body) — origin=None이면 헤더 미포함
     attempts = [
-        # ★ v2 + www origin (이전에 data:[] JSON 응답 확인됨 — 파라미터 변형 시도)
+        # ★★ 원본 크롤러 파라미터 (goodsNumber + reviewType + page/size)
+        # v2 POST www origin
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          "https://www.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
-         "https://www.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "pageIdx": page, "rowsPerPage": PAGE_SIZE, "sortCode": order}),
-        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
-         "https://www.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE}),
-        # v2 GET + www origin (POST가 빈 배열 반환 → GET도 시도)
-        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v2 + no origin
+         {**{"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
+          **({} if not sort_orig else {"sortType": sort_orig})}),
+        # v2 POST no origin
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          None,
-         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v1 POST (JSON 응답 확인됨 — NOT_FOUND)
-        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
-         "https://m.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v1 + goodsNo 숫자만 (A 제거)
-        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
-         "https://m.oliveyoung.co.kr",
-         {"goodsNo": goods_no_num, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # v1 GET (쿼리 파라미터)
-        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "GET",
-         "https://m.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # ★ REST 경로 패턴: /reviews/{goodsNo}
-        (f"https://m.oliveyoung.co.kr/review/api/v1/reviews/{goods_no}", "GET",
-         "https://m.oliveyoung.co.kr",
-         {"pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        (f"https://m.oliveyoung.co.kr/review/api/v1/reviews/{goods_no_num}", "GET",
-         "https://m.oliveyoung.co.kr",
-         {"pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # ★★ v2 경로 패턴 — BAD_REQUEST 확인됨, 파라미터 변형 집중 시도
-        # 파라미터 없이 → 어떤 필드가 필요한지 확인
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
+        # ★★ v2 경로 패턴 — WAF 우회 확인됨, reviewType 추가
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
-         {}),
-        # page/size 형식
+         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "sort": order}),
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"page": page - 1, "size": PAGE_SIZE}),  # 0-indexed
-        # pageNo/pageSize 형식
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"pageNo": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # pageNum/pageSize (기존)
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
-        # POST로도 시도
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "POST",
-         "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "sort": order}),
-        # m origin으로 path 시도
+         {"page": page - 1, "size": PAGE_SIZE, "reviewType": "ALL"}),  # 0-indexed
         (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://m.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
+        # v2 path + 추가 파라미터 조합
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"pageNum": page, "pageSize": PAGE_SIZE, "reviewType": "ALL"}),
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
          {"page": page, "size": PAGE_SIZE}),
-        # v2 POST (body)
-        ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+        # v1 (JSON 응답 확인됨 — NOT_FOUND이지만 원본 파라미터로 재시도)
+        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
          "https://m.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "pageNum": page, "pageSize": PAGE_SIZE, "orderType": order}),
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
+        ("https://m.oliveyoung.co.kr/review/api/v1/reviews", "POST",
+         "https://m.oliveyoung.co.kr",
+         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}),
     ]
 
     # RSC에서 찾은 대체 goodsNo로 v1 추가 시도
@@ -574,16 +544,25 @@ def _try_mobile_review_api(
                 text = resp.text.lstrip()
                 if text.startswith(("{", "[")):
                     data = resp.json()
-                    # NOT_FOUND 같은 에러 응답 건너뜀
-                    if isinstance(data, dict) and data.get("status") in ("NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST"):
+                    # 에러 응답 건너뜀
+                    api_status = data.get("status") if isinstance(data, dict) else None
+                    if api_status in ("NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST", "METHOD_NOT_ALLOWED"):
                         if log and page == 1:
-                            log(f"ℹ️ {data.get('status')} [{label}]: {data.get('message','')[:80]}")
+                            log(f"ℹ️ {api_status} [{label}]: {data.get('message','')[:80]}")
                         continue
                     reviews: list = []
                     _extract_from_json_structure(data, reviews)
+                    # 원본 API 응답 구조: status=SUCCESS, data=[...], totalCnt=N
+                    if not reviews and isinstance(data, dict) and api_status == "SUCCESS":
+                        review_list = data.get("data") or data.get("list") or []
+                        if isinstance(review_list, list):
+                            for item in review_list:
+                                r = _parse_review_dict(item)
+                                if r:
+                                    reviews.append(r)
                     total = 0
                     if isinstance(data, dict):
-                        for k in ["totalCnt", "totalCount", "total"]:
+                        for k in ["totalCnt", "totalCount", "total", "pageData"]:
                             if data.get(k) is not None:
                                 try:
                                     total = int(data[k])
@@ -591,7 +570,7 @@ def _try_mobile_review_api(
                                 except Exception:
                                     pass
                         if log and page == 1 and not reviews:
-                            log(f"ℹ️ 모바일 JSON 키: {list(data.keys())[:8]} | data={str(data.get('data'))[:60]}")
+                            log(f"ℹ️ status={api_status} 키: {list(data.keys())[:8]} | data={str(data.get('data'))[:80]}")
                     if reviews:
                         return reviews, total, api_url
         except Exception as e:
