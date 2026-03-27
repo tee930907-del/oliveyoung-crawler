@@ -569,41 +569,42 @@ def _try_mobile_review_api(
                      "star_desc": "RATING_DESC", "star_asc": "RATING_ASC"}
     sort_orig = sort_map_orig.get(sort_code)
 
+    # JS 번들에서 발견된 X-Access-Token (api.dp 로깅 API용이지만 v2 인증에도 사용 가능)
+    _X_TOKEN = "94A0D5853594D098111EA0C7E5C9CDD09958C842"
+    _token_h = {"X-Access-Token": _X_TOKEN}
+
     # (endpoint, method, origin, body, extra_headers)
     attempts = [
-        # ★★★ api.dp.oliveyoung.co.kr — JS 번들에서 발견된 새 도메인
-        (f"https://api.dp.oliveyoung.co.kr/review/api/v2/reviews", "POST",
+        # ★ v2 path GET + X-Access-Token (BAD_REQUEST 해결 시도)
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
-         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
-        (f"https://api.dp.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, _token_h),
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"pageIdx": page, "rowsPerPage": PAGE_SIZE, "sortCode": "NEW"}, _token_h),
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE, "channelCd": "MOBILE"}, _token_h),
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"page": page, "size": PAGE_SIZE}, _token_h),
+        # ★ v2 path + goodsNo 중복 전달
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
+         "https://www.oliveyoung.co.kr",
+         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, _token_h),
+        # ★ v2 path (토큰 없이, 기존과 같음)
+        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
          {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
-        (f"https://api.dp.oliveyoung.co.kr/v2/reviews", "POST",
-         "https://www.oliveyoung.co.kr",
-         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
-        (f"https://api.dp.oliveyoung.co.kr/reviews", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE}, None),
-
-        # 기존 m.oliveyoung 시도
+        # ★ v2 POST (Cloudflare 통과 시도)
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          "https://www.oliveyoung.co.kr",
-         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, _token_h),
         ("https://m.oliveyoung.co.kr/review/api/v2/reviews", "POST",
          None,
-         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, None),
+         {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"}, _token_h),
         # Next.js API 라우트 가능성
         (f"https://www.oliveyoung.co.kr/api/reviews/{goods_no}", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"page": page, "size": PAGE_SIZE}, None),
-        (f"https://www.oliveyoung.co.kr/api/review", "GET",
-         "https://www.oliveyoung.co.kr",
-         {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE}, None),
-        # v2 path 기본
-        (f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}", "GET",
          "https://www.oliveyoung.co.kr",
          {"page": page, "size": PAGE_SIZE}, None),
         # v1
@@ -701,30 +702,34 @@ def _ensure_playwright_browser(log=None) -> bool:
         import playwright  # noqa: F401
     except ImportError:
         if log:
-            log("ℹ️ playwright 패키지 미설치")
+            log("ℹ️ playwright 패키지 미설치 — pip install playwright 필요")
         return False
 
     import os
     cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
-    if os.path.isdir(cache_dir) and os.listdir(cache_dir):
+    already = os.path.isdir(cache_dir) and bool(os.listdir(cache_dir))
+    if log:
+        log(f"ℹ️ Playwright 캐시: {cache_dir} (존재={already})")
+    if already:
         return True
 
     if log:
-        log("⬇️ Playwright Chromium 설치 중 (최초 1회)...")
+        log("⬇️ Playwright Chromium 설치 중 (최초 1회, 약 60초)...")
     try:
         result = subprocess.run(
             ["playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, timeout=300,
         )
         if result.returncode == 0:
             if log:
                 log("✅ Playwright Chromium 설치 완료")
             return True
         if log:
-            log(f"⚠️ playwright install 실패: {result.stderr[:100]}")
+            err = (result.stderr or result.stdout or "")[:200]
+            log(f"⚠️ playwright install 실패(rc={result.returncode}): {err}")
     except Exception as e:
         if log:
-            log(f"⚠️ playwright install 예외: {str(e)[:80]}")
+            log(f"⚠️ playwright install 예외: {str(e)[:100]}")
     return False
 
 
