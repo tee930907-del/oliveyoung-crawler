@@ -48,8 +48,9 @@ PC_HEADERS = {
 }
 MOBILE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
-    "Origin": "https://www.oliveyoung.co.kr",
-    "Referer": "https://www.oliveyoung.co.kr/",
+    "Content-Type": "application/json",
+    "Origin": "https://m.oliveyoung.co.kr",
+    "Referer": "https://m.oliveyoung.co.kr/",
     "User-Agent": MOBILE_UA,
     "X-Requested-With": "XMLHttpRequest",
 }
@@ -131,25 +132,25 @@ def find_review_url_in_js(session, html: str) -> str | None:
     return None
 
 
-def _try_mobile_api_get(session, goods_no: str, page: int) -> dict | None:
-    """모바일 API GET 방식 시도"""
-    param_variants = [
-        {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE},
-        {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE},
+def _try_mobile_api(session, goods_no: str, page: int) -> dict | None:
+    """모바일 API POST JSON 방식 시도 (Origin: m.oliveyoung.co.kr)"""
+    body_variants = [
+        {"goodsNo": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
+        {"goodsNumber": goods_no, "page": page, "size": PAGE_SIZE, "reviewType": "ALL"},
         {"goodsNo": goods_no, "pageNo": page, "pageSize": PAGE_SIZE},
     ]
-    for params in param_variants:
+    for body in body_variants:
         try:
-            resp = session.get(
-                MOBILE_REVIEW_URL, params=params, headers=MOBILE_HEADERS, timeout=15
+            resp = session.post(
+                MOBILE_REVIEW_URL, json=body, headers=MOBILE_HEADERS, timeout=15
             )
             if resp.status_code != 200:
                 continue
             data = resp.json()
-            reviews = data.get("data") or []
             total = data.get("totalCnt")
-            # 리뷰가 있거나 totalCnt가 숫자면 올바른 응답
-            if reviews or (total is not None and total != "None"):
+            reviews = data.get("data") or []
+            # totalCnt가 숫자(null이 아님)이거나 리뷰 데이터 있으면 성공
+            if reviews or (total is not None and str(total) not in ("None", "null", "")):
                 return data
         except Exception:
             continue
@@ -265,25 +266,25 @@ def crawl_reviews(
     else:
         log("⚠️ 상품명을 가져오지 못했습니다.")
 
-    # 2. 모바일 사이트 warm-up
+    # 2. 모바일 사이트 warm-up + Referer 설정
+    mobile_product_url = f"https://m.oliveyoung.co.kr/m/goods/getGoodsDetail.do?goodsNo={goods_no}"
     try:
-        session.get(
-            f"https://m.oliveyoung.co.kr/m/goods/getGoodsDetail.do?goodsNo={goods_no}",
-            timeout=10,
-        )
+        session.get(mobile_product_url, timeout=10)
     except Exception:
         pass
+    # 모바일 Referer를 상품 페이지로 설정
+    MOBILE_HEADERS["Referer"] = mobile_product_url
 
-    # 3. 모바일 API GET 방식 1페이지 테스트
+    # 3. 모바일 API POST 방식 1페이지 테스트
     log("🔍 API 탐색 중...")
     progress(0.08)
-    test_data = _try_mobile_api_get(session, goods_no, 1)
+    test_data = _try_mobile_api(session, goods_no, 1)
 
     if test_data is not None:
-        log(f"✅ 모바일 API GET 성공: {list(test_data.keys())}")
+        log(f"✅ 모바일 API 성공: {list(test_data.keys())}")
         use_mobile = True
     else:
-        log("⚠️ 모바일 API GET 실패 → JS 번들에서 엔드포인트 탐색 중...")
+        log("⚠️ 모바일 API 실패 → JS 번들에서 엔드포인트 탐색 중...")
         use_mobile = False
 
         # JS 번들에서 리뷰 URL 탐색
@@ -332,7 +333,7 @@ def crawl_reviews(
     for page_idx in range(start_page, max_pages + 1):
         try:
             if use_mobile:
-                data = _try_mobile_api_get(session, goods_no, page_idx)
+                data = _try_mobile_api(session, goods_no, page_idx)
                 if data is None:
                     consecutive_empty += 1
                     log(f"⚠️ 페이지 {page_idx}: 응답 없음")
