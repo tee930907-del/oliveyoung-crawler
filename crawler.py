@@ -484,6 +484,13 @@ def _scan_js_for_review_api(session, html_text: str, rsc_text: str = "", log=Non
                         if log:
                             log(f"🔑 oliveyoung URL: {html_lib.escape(u[:120])}")
 
+                    # ★ api.dp.oliveyoung.co.kr 주변 맥락 탐색
+                    dp_idx = bundle_text.find('api.dp.oliveyoung')
+                    if dp_idx >= 0:
+                        dp_ctx = bundle_text[max(0, dp_idx - 100):dp_idx + 300].replace('\n', ' ')
+                        if log:
+                            log(f"🔑 api.dp 맥락: {html_lib.escape(dp_ctx[:350])}")
+
                     # /review/ 또는 /api/ 경로 탐색
                     api_paths = re.findall(
                         r'["\`](/(?:review|api)/[^\s"\'`\\]{3,80})["\`]',
