@@ -1474,16 +1474,10 @@ def crawl_reviews(
             and len(all_reviews) < 500):   # 이미 충분하면 스킵
 
         # 확인된 유효: USEFUL_SCORE_DESC, RATING_DESC, RATING_ASC
-        # 확인된 무효 (BAD_REQUEST): NEW, USEFUL_SCORE_ASC
-        # "최신순" 후보들을 다 시도
-        extra_sorts = [
-            "RECENT", "REG_DT_DESC", "DATE_DESC", "LATEST", "REGIST_DATE_DESC",
-            "RATING_DESC", "RATING_ASC",
-        ]
+        # 날짜 기반 sortType은 /checksum에서 지원 안 함 (모두 BAD_REQUEST)
+        extra_sorts = ["RATING_DESC", "RATING_ASC"]
         current_sort = (playwright_info.get("req_body") or {}).get("sortType", "")
-        # 이미 알려진 무효 sortType 제외
-        _known_bad = {"NEW", "USEFUL_SCORE_ASC"}
-        extra_sorts = [s for s in extra_sorts if s != current_sort and s not in _known_bad]
+        extra_sorts = [s for s in extra_sorts if s != current_sort]
 
         for extra_sort in extra_sorts:
             _extra_info = dict(playwright_info)
@@ -1545,6 +1539,52 @@ def crawl_reviews(
             added = len(all_reviews) - before_extra
             log(f"📄 {extra_sort}: +{added}개 추가 (누적 {len(all_reviews)}개)")
             # 실패해도 다른 sortType은 계속 시도 (break 제거)
+
+    # ── 5. photo-reviews 엔드포인트 추가 수집 ──
+    # Playwright XHR 로그에서 확인된 /photo-reviews 엔드포인트
+    if use_playwright_replay and playwright_info:
+        _photo_url = "https://m.oliveyoung.co.kr/review/api/v2/reviews/photo-reviews"
+        _hdr_p = {
+            k: v for k, v in playwright_info.get("req_headers", {}).items()
+            if k.lower() not in (":method", ":path", ":scheme", ":authority",
+                                 "content-length", "transfer-encoding")
+        }
+        _base_body = playwright_info.get("req_body") or {}
+        before_photo = len(all_reviews)
+        consecutive_photo = 0
+        for _pi in range(0, 60):
+            _pb = dict(_base_body)
+            _pb["page"] = _pi
+            try:
+                _rp = session.post(_photo_url, json=_pb, headers=_hdr_p, timeout=15)
+                if _rp.status_code != 200:
+                    if _pi == 0 and log:
+                        log(f"ℹ️ photo-reviews HTTP {_rp.status_code} (스킵)")
+                    break
+                _dp = _rp.json()
+                if isinstance(_dp, dict) and _dp.get("status") in (
+                        "NOT_FOUND", "ERROR", "FAIL", "BAD_REQUEST"):
+                    if _pi == 0 and log:
+                        log(f"ℹ️ photo-reviews: {_dp.get('status')} (스킵)")
+                    break
+                _rp_revs: list = []
+                _extract_from_json_structure(_dp, _rp_revs)
+                if not _rp_revs:
+                    consecutive_photo += 1
+                    if consecutive_photo >= 2:
+                        break
+                    continue
+                consecutive_photo = 0
+                for r in _rp_revs:
+                    key = r.get("content", "")[:50]
+                    if not any(e.get("content", "")[:50] == key for e in all_reviews):
+                        all_reviews.append(r)
+                time.sleep(random.uniform(0.2, 0.4))
+            except Exception:
+                break
+        added_photo = len(all_reviews) - before_photo
+        if added_photo > 0:
+            log(f"📸 photo-reviews: +{added_photo}개 추가 (누적 {len(all_reviews)}개)")
 
     all_reviews = deduplicate_reviews(all_reviews)
     progress(1.0)
