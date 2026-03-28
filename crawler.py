@@ -955,6 +955,41 @@ def _discover_review_api_via_playwright(goods_no: str, log=None) -> dict | None:
                         break
                     page.wait_for_timeout(500)
 
+            # 데스크톱 페이지에서 리뷰 로드 실패 → 모바일 페이지로 전환 시도
+            if not info["reviews"]:
+                _mob_url = (f"https://m.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
+                            f"?goodsNo={goods_no}")
+                if log:
+                    log("⚠️ 데스크톱 페이지 리뷰 로드 실패 → 모바일 페이지 전환 시도...")
+                try:
+                    page.goto(_mob_url, wait_until="domcontentloaded", timeout=30_000)
+                    # 모바일 페이지: 리뷰 탭 클릭 시도
+                    for _msel in ["a:has-text('리뷰')", "[class*='tab']:has-text('리뷰')",
+                                  "button:has-text('리뷰')"]:
+                        try:
+                            _me = page.locator(_msel).first
+                            if _me.is_visible(timeout=2_000):
+                                _me.click(timeout=3_000)
+                                break
+                        except Exception:
+                            continue
+                    for _ in range(20):  # 최대 10초 대기
+                        if info["reviews"]:
+                            break
+                        page.wait_for_timeout(500)
+                    if not info["reviews"]:
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(2000)
+                        for _ in range(10):
+                            if info["reviews"]:
+                                break
+                            page.wait_for_timeout(500)
+                    if log and info["reviews"]:
+                        log(f"✅ 모바일 페이지 전환 성공: {len(info['reviews'])}개 선수집")
+                except Exception as _mob_e:
+                    if log:
+                        log(f"⚠️ 모바일 페이지 전환 실패: {str(_mob_e)[:60]}")
+
             # 자연 XHR 추가 캡처 대기: 페이지가 연속으로 여러 checksum 호출 → 2초 더 대기
             if info["reviews"]:
                 page.wait_for_timeout(2000)
