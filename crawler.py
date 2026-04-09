@@ -288,17 +288,21 @@ def crawl_reviews(
     else:
         log("⚠️ 상품명을 가져오지 못했습니다. (크롤링은 계속됩니다)")
 
+    # 진단: curl_cffi 가 실제로 로드됐는지
+    log(f"🔧 curl_cffi={'ON' if HAS_CURL_CFFI else 'OFF (fallback to plain requests)'}")
+
     # 1-b. m.oliveyoung.co.kr 호스트 쿠키 워밍업
     # 클라우드 IP에서 cursor API 가 곧장 403을 뱉는 문제 우회용:
     # 모바일 호스트 자체를 한 번 GET 해서 cf_clearance/JSESSIONID 등을 받아둔다.
     try:
-        session.get(
-            f"https://m.oliveyoung.co.kr/m/goods/{goods_no}",
+        warm = session.get(
+            f"https://m.oliveyoung.co.kr/m/store/goods/getGoodsDetail.do?goodsNo={goods_no}",
             timeout=15,
             headers={"Referer": "https://m.oliveyoung.co.kr/"},
         )
-    except Exception:
-        pass
+        log(f"🔥 워밍업 GET: HTTP {warm.status_code} (len={len(warm.text)})")
+    except Exception as e:
+        log(f"🔥 워밍업 실패: {str(e)[:80]}")
 
     # 2. 리뷰 API 호출 — 커서 기반 (lavender 2026-04 리뉴얼)
     log("🔍 리뷰를 수집하는 중...")
@@ -337,7 +341,18 @@ def crawl_reviews(
 
             if resp.status_code != 200:
                 consecutive_empty += 1
-                log(f"⚠️ 페이지 {page_idx}: HTTP {resp.status_code}")
+                # 첫 실패의 응답 본문 미리보기 + 핵심 헤더 덤프 (Cloudflare 챌린지 식별용)
+                if consecutive_empty == 1:
+                    body_preview = (resp.text or "")[:300].replace("\n", " ")
+                    cf_ray = resp.headers.get("cf-ray") or resp.headers.get("CF-RAY")
+                    server = resp.headers.get("server") or resp.headers.get("Server")
+                    log(
+                        f"⚠️ 페이지 {page_idx}: HTTP {resp.status_code} "
+                        f"(server={server}, cf-ray={cf_ray})"
+                    )
+                    log(f"   본문: {body_preview}")
+                else:
+                    log(f"⚠️ 페이지 {page_idx}: HTTP {resp.status_code}")
                 if consecutive_empty >= 3:
                     log(f"⚠️ 연속 오류로 수집 종료 (페이지 {page_idx})")
                     break
