@@ -29,9 +29,13 @@ MAX_PAGES = 200
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     "Content-Type": "application/json",
     "Origin": "https://www.oliveyoung.co.kr",
     "Referer": "https://www.oliveyoung.co.kr/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
 }
 
 
@@ -283,6 +287,18 @@ def crawl_reviews(
         log(f"✅ 상품명: {product_name}")
     else:
         log("⚠️ 상품명을 가져오지 못했습니다. (크롤링은 계속됩니다)")
+
+    # 1-b. m.oliveyoung.co.kr 호스트 쿠키 워밍업
+    # 클라우드 IP에서 cursor API 가 곧장 403을 뱉는 문제 우회용:
+    # 모바일 호스트 자체를 한 번 GET 해서 cf_clearance/JSESSIONID 등을 받아둔다.
+    try:
+        session.get(
+            f"https://m.oliveyoung.co.kr/m/goods/{goods_no}",
+            timeout=15,
+            headers={"Referer": "https://m.oliveyoung.co.kr/"},
+        )
+    except Exception:
+        pass
 
     # 2. 리뷰 API 호출 — 커서 기반 (lavender 2026-04 리뉴얼)
     log("🔍 리뷰를 수집하는 중...")
